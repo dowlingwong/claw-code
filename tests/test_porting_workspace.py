@@ -1,14 +1,28 @@
 from __future__ import annotations
 
+import io
 import subprocess
 import sys
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
+from src.agent_loop import (
+    build_agent_messages,
+    infer_tool_call_from_prompt,
+    parse_agent_response,
+    prompt_requires_tool,
+    run_agent_task,
+    tool_result_message,
+)
 from src.commands import PORTED_COMMANDS
+from src.llm_backend import normalize_ollama_response
 from src.parity_audit import run_parity_audit
 from src.port_manifest import build_port_manifest
 from src.query_engine import QueryEnginePort
+from src.runtime_tools import RuntimeToolRegistry
+from src.task import DEFAULT_SYSTEM_PROMPT, build_chat_messages, run_local_task
 from src.tools import PORTED_TOOLS
 
 
@@ -242,6 +256,158 @@ class PortingWorkspaceTests(unittest.TestCase):
         self.assertIn('Bootstrap Graph', graph_result.stdout)
         self.assertIn('mode=direct-connect', direct_result.stdout)
         self.assertIn('mode=deep-link', deep_link_result.stdout)
+
+    def test_build_chat_messages_includes_default_system_prompt(self) -> None:
+        messages = build_chat_messages('Summarize this repo')
+        self.assertEqual(messages[0], {'role': 'system', 'content': DEFAULT_SYSTEM_PROMPT})
+        self.assertEqual(messages[1], {'role': 'user', 'content': 'Summarize this repo'})
+
+    def test_run_local_task_uses_backend_response_content(self) -> None:
+        with patch('src.task.OllamaBackend.chat', return_value=normalize_ollama_response({'message': {'content': 'local answer'}})) as chat_mock:
+            result = run_local_task('hello')
+        self.assertEqual(result, 'local answer')
+        sent_messages = chat_mock.call_args.args[0]
+        self.assertEqual(sent_messages[-1], {'role': 'user', 'content': 'hello'})
+
+    def test_normalize_ollama_response_returns_assistant_content(self) -> None:
+        response = normalize_ollama_response(
+            {
+                'model': 'qwen2.5-coder:7b',
+                'message': {'role': 'assistant', 'content': 'hello from ollama'},
+            }
+        )
+        self.assertEqual(response.content, 'hello from ollama')
+        self.assertEqual(response.raw['model'], 'qwen2.5-coder:7b')
+
+    def test_chat_cli_reads_prompt_from_stdin(self) -> None:
+        from src.main import build_parser, resolve_chat_prompt
+
+        parser = build_parser()
+        args = parser.parse_args(['chat'])
+        with patch('sys.stdin.read', return_value='stdin prompt'):
+            self.assertEqual(resolve_chat_prompt(args, parser), 'stdin prompt')
+
+    def test_runtime_tool_registry_reads_searches_edits_and_runs_shell(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            target = root / 'notes.txt'
+            target.write_text('alpha\nbeta\n', encoding='utf-8')
+            registry = RuntimeToolRegistry(root=root)
+
+            read_result = registry.execute('read_file', {'path': 'notes.txt'})
+            self.assertTrue(read_result.success)
+            self.assertIn('1\talpha', read_result.output)
+
+            search_result = registry.execute('search_files', {'pattern': 'beta', 'path': '.'})
+            self.assertTrue(search_result.success)
+            self.assertIn('notes.txt:2:beta', search_result.output)
+
+            edit_result = registry.execute(
+                'edit_file',
+                {'path': 'notes.txt', 'old_text': 'beta\n', 'new_text': 'gamma\n'},
+            )
+            self.assertTrue(edit_result.success)
+            self.assertEqual(target.read_text(encoding='utf-8'), 'alpha\ngamma\n')
+
+            shell_result = registry.execute('run_shell_command', {'command': 'printf shell-ok'})
+            self.assertTrue(shell_result.success)
+            self.assertEqual(shell_result.output, 'shell-ok')
+
+    def test_parse_agent_response_supports_tool_calls_and_finals(self) -> None:
+        tool_call = parse_agent_response('{"type":"tool_call","name":"read_file","arguments":{"path":"src/main.py"}}')
+        final = parse_agent_response('{"type":"final","content":"done"}')
+        self.assertEqual(tool_call['name'], 'read_file')
+        self.assertEqual(final['content'], 'done')
+
+    def test_prompt_requires_tool_for_workspace_inspection_prompts(self) -> None:
+        self.assertTrue(prompt_requires_tool('read src/main.py lines 1 to 40'))
+        self.assertTrue(prompt_requires_tool("search the src tree for 'agent_parser'"))
+        self.assertFalse(prompt_requires_tool('say hello'))
+
+    def test_infer_tool_call_from_prompt_recognizes_read_and_search(self) -> None:
+        read_call = infer_tool_call_from_prompt('read src/main.py lines 1 to 40')
+        search_call = infer_tool_call_from_prompt("search the src tree for 'agent_parser'")
+        self.assertEqual(read_call, {'name': 'read_file', 'arguments': {'path': 'src/main.py', 'start_line': 1, 'end_line': 40}})
+        self.assertEqual(search_call, {'name': 'search_files', 'arguments': {'path': 'src', 'pattern': 'agent_parser'}})
+
+    def test_tool_result_message_is_json_prefixed(self) -> None:
+        message = tool_result_message({'name': 'read_file', 'success': True, 'output': 'ok'})
+        self.assertTrue(message.startswith('TOOL_RESULT '))
+        self.assertIn('"name": "read_file"', message)
+
+    def test_build_agent_messages_mentions_workspace_and_tools(self) -> None:
+        messages = build_agent_messages('inspect repo', Path('/tmp/workspace'))
+        self.assertEqual(messages[1], {'role': 'user', 'content': 'inspect repo'})
+        self.assertIn('Workspace root: /tmp/workspace', messages[0]['content'])
+        self.assertIn('read_file', messages[0]['content'])
+
+    def test_run_agent_task_executes_tools_end_to_end(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / 'example.txt').write_text('hello world\n', encoding='utf-8')
+            responses = [
+                normalize_ollama_response(
+                    {
+                        'message': {
+                            'content': '{"type":"tool_call","name":"read_file","arguments":{"path":"example.txt"}}'
+                        }
+                    }
+                ),
+                normalize_ollama_response(
+                    {
+                        'message': {
+                            'content': '{"type":"final","content":"Read complete."}'
+                        }
+                    }
+                ),
+            ]
+            with patch('src.agent_loop.OllamaBackend.chat', side_effect=responses) as chat_mock:
+                result = run_agent_task('inspect file', root=root, max_turns=3, trace=True)
+
+            self.assertEqual(result.content, 'Read complete.')
+            self.assertEqual(result.tool_calls, ('read_file',))
+            self.assertTrue(any(event.startswith('tool_call') for event in result.trace_events))
+            second_call_messages = chat_mock.call_args_list[1].args[0]
+            self.assertTrue(any(message['content'].startswith('TOOL_RESULT ') for message in second_call_messages if message['role'] == 'user'))
+
+    def test_run_agent_task_rejects_direct_final_when_tool_is_required(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / 'example.txt').write_text('hello world\n', encoding='utf-8')
+            responses = [
+                normalize_ollama_response(
+                    {
+                        'message': {
+                            'content': '{"type":"final","content":"No subcommands found."}'
+                        }
+                    }
+                ),
+                normalize_ollama_response(
+                    {
+                        'message': {
+                            'content': '{"type":"final","content":"Read complete after tool use."}'
+                        }
+                    }
+                ),
+            ]
+            with patch('src.agent_loop.OllamaBackend.chat', side_effect=responses):
+                result = run_agent_task('read example.txt lines 1 to 1', root=root, max_turns=3, trace=True)
+
+            self.assertEqual(result.content, 'Read complete after tool use.')
+            self.assertEqual(result.tool_calls, ('read_file',))
+            self.assertTrue(any('tool_required_reject' in event for event in result.trace_events))
+
+    def test_agent_cli_invokes_agent_loop(self) -> None:
+        from src.main import main
+
+        with patch('src.main.run_agent_task') as run_agent_task_mock:
+            run_agent_task_mock.return_value.content = 'agent output'
+            run_agent_task_mock.return_value.trace_events = ('tool_call[1]=read_file {"path":"src/main.py"}',)
+            with patch('sys.stdout', new=io.StringIO()):
+                with patch('sys.stderr', new=io.StringIO()):
+                    exit_code = main(['agent', 'inspect repo', '--trace'])
+        self.assertEqual(exit_code, 0)
+        run_agent_task_mock.assert_called_once()
 
 
 if __name__ == '__main__':

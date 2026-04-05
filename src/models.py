@@ -37,6 +37,12 @@ class UsageSummary:
         )
 
 
+@dataclass(frozen=True)
+class AssistantResponse:
+    content: str
+    raw: dict | None = None
+
+
 @dataclass
 class PortingBacklog:
     title: str

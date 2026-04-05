@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import sys
 
 from .bootstrap_graph import build_bootstrap_graph
 from .command_graph import build_command_graph
 from .commands import execute_command, get_command, get_commands, render_command_index
+from .agent_loop import DEFAULT_AGENT_SYSTEM_PROMPT, run_agent_task
+from .llm_backend import DEFAULT_OLLAMA_HOST, DEFAULT_OLLAMA_MODEL, LLMBackendError
 from .direct_modes import run_deep_link, run_direct_connect
 from .parity_audit import run_parity_audit
 from .permissions import ToolPermissionContext
@@ -14,6 +17,7 @@ from .remote_runtime import run_remote_mode, run_ssh_mode, run_teleport_mode
 from .runtime import PortRuntime
 from .session_store import load_session
 from .setup import run_setup
+from .task import DEFAULT_SYSTEM_PROMPT, run_local_task
 from .tool_pool import assemble_tool_pool
 from .tools import execute_tool, get_tool, get_tools, render_tool_index
 
@@ -88,7 +92,34 @@ def build_parser() -> argparse.ArgumentParser:
     exec_tool_parser = subparsers.add_parser('exec-tool', help='execute a mirrored tool shim by exact name')
     exec_tool_parser.add_argument('name')
     exec_tool_parser.add_argument('payload')
+
+    chat_parser = subparsers.add_parser('chat', help='send a prompt to a local Ollama model')
+    chat_parser.add_argument('prompt', nargs='?')
+    chat_parser.add_argument('--model', default=DEFAULT_OLLAMA_MODEL)
+    chat_parser.add_argument('--host', default=DEFAULT_OLLAMA_HOST)
+    chat_parser.add_argument('--system')
+
+    agent_parser = subparsers.add_parser('agent', help='run the local Ollama agent loop with executable workspace tools')
+    agent_parser.add_argument('prompt', nargs='?')
+    agent_parser.add_argument('--model', default=DEFAULT_OLLAMA_MODEL)
+    agent_parser.add_argument('--host', default=DEFAULT_OLLAMA_HOST)
+    agent_parser.add_argument('--system')
+    agent_parser.add_argument('--max-turns', type=int, default=8)
+    agent_parser.add_argument('--deny-tool', action='append', default=[])
+    agent_parser.add_argument('--deny-prefix', action='append', default=[])
+    agent_parser.add_argument('--trace', action='store_true')
     return parser
+
+
+def resolve_chat_prompt(args: argparse.Namespace, parser: argparse.ArgumentParser) -> str:
+    if args.prompt:
+        return args.prompt
+    prompt = sys.stdin.read().strip()
+    if prompt:
+        return prompt
+    command_name = getattr(args, 'command', 'command')
+    parser.error(f'{command_name} requires a prompt argument or stdin input')
+    raise AssertionError('unreachable')
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -205,6 +236,42 @@ def main(argv: list[str] | None = None) -> int:
         result = execute_tool(args.name, args.payload)
         print(result.message)
         return 0 if result.handled else 1
+    if args.command == 'chat':
+        prompt = resolve_chat_prompt(args, parser)
+        try:
+            print(
+                run_local_task(
+                    prompt,
+                    model=args.model,
+                    host=args.host,
+                    system_prompt=args.system if args.system is not None else DEFAULT_SYSTEM_PROMPT,
+                )
+            )
+        except LLMBackendError as error:
+            print(error, file=sys.stderr)
+            return 1
+        return 0
+    if args.command == 'agent':
+        prompt = resolve_chat_prompt(args, parser)
+        permission_context = ToolPermissionContext.from_iterables(args.deny_tool, args.deny_prefix)
+        try:
+            result = run_agent_task(
+                prompt,
+                model=args.model,
+                host=args.host,
+                system_prompt=args.system if args.system is not None else DEFAULT_AGENT_SYSTEM_PROMPT,
+                max_turns=args.max_turns,
+                permission_context=permission_context,
+                trace=args.trace,
+            )
+            if args.trace:
+                for event in result.trace_events:
+                    print(f'[trace] {event}', file=sys.stderr)
+            print(result.content)
+        except LLMBackendError as error:
+            print(error, file=sys.stderr)
+            return 1
+        return 0
     parser.error(f'unknown command: {args.command}')
     return 2
 

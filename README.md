@@ -142,6 +142,17 @@ python3 -m src.main commands --limit 10
 python3 -m src.main tools --limit 10
 ```
 
+Run a local Ollama-backed chat prompt:
+
+```bash
+ollama run qwen2.5-coder:7b
+python3 -m src.main chat "write a hello world in python"
+```
+
+The local chat path uses Ollama at `http://localhost:11434` by default and sends a single non-streaming `/api/chat` request to `qwen2.5-coder:7b`.
+
+For the current local agent/tool integration, request features, and command examples, see [`OLLAMA_INTEGRATION.md`](./OLLAMA_INTEGRATION.md).
+
 ## Current Parity Checkpoint
 
 The port now mirrors the archived root-entry file surface, top-level subsystem names, and command/tool inventories much more closely than before. However, it is **not yet** a full runtime-equivalent replacement for the original TypeScript system; the Python tree still contains fewer executable runtime slices than the archived source.
