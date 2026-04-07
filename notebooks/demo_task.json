@@ -1,0 +1,12 @@
+{
+  "objective": "Inspect the Python CLI and report the worker-related commands.",
+  "scope": "Inspect src/main.py and worker modules only when needed.",
+  "repo": "claw-code",
+  "branch_policy": "Do not create or switch branches.",
+  "acceptance_tests": [
+    "python3 -m unittest tests/test_porting_workspace.py"
+  ],
+  "commit_policy": "Do not commit.",
+  "reporting_contract": "Report worker commands, changed files, verification results, and blockers.",
+  "escalation_policy": "Stop if Ollama is unavailable or a required tool fails repeatedly."
+}

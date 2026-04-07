@@ -17,6 +17,7 @@ DEFAULT_AGENT_SYSTEM_PROMPT = (
     '{"type":"final","content":"..."}. '
     'Do not wrap JSON in markdown fences.'
 )
+MUTATING_TOOL_NAMES = frozenset({'edit_file', 'run_shell_command'})
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,8 @@ class AgentRunResult:
     content: str
     turns: int
     tool_calls: tuple[str, ...]
+    tool_trace: tuple[dict[str, Any], ...] = ()
+    stop_reason: str = 'completed'
     trace_events: tuple[str, ...] = ()
 
 
@@ -46,8 +49,11 @@ def run_agent_task(
     tools = RuntimeToolRegistry(root=workspace_root, permission_context=permission_context)
     messages = build_agent_messages(prompt=prompt, workspace_root=workspace_root, system_prompt=system_prompt)
     tool_calls: list[str] = []
+    tool_trace: list[dict[str, Any]] = []
     trace_events: list[str] = []
     tool_required = prompt_requires_tool(prompt)
+    edit_required = prompt_requires_edit(prompt)
+    required_edit_target = infer_required_edit_target(prompt)
     fallback_used = False
 
     for turn in range(1, max_turns + 1):
@@ -69,7 +75,7 @@ def run_agent_task(
                 fallback_used = True
                 if trace:
                     trace_events.append(f'fallback_tool[{turn}]={fallback["name"]} {json.dumps(fallback["arguments"], ensure_ascii=True)}')
-                _append_tool_result(messages, tools, fallback, tool_calls, trace_events if trace else None, turn)
+                _append_tool_result(messages, tools, fallback, tool_calls, tool_trace, trace_events if trace else None, turn)
                 continue
             messages.append({'role': 'user', 'content': protocol_error_message(str(error))})
             continue
@@ -85,18 +91,34 @@ def run_agent_task(
                     fallback_used = True
                     if trace:
                         trace_events.append(f'fallback_tool[{turn}]={fallback["name"]} {json.dumps(fallback["arguments"], ensure_ascii=True)}')
-                    _append_tool_result(messages, tools, fallback, tool_calls, trace_events if trace else None, turn)
+                    _append_tool_result(messages, tools, fallback, tool_calls, tool_trace, trace_events if trace else None, turn)
                     continue
                 messages.append({'role': 'user', 'content': tool_required_message()})
+                continue
+            if edit_required and not has_successful_edit(tool_trace, required_edit_target):
+                if trace:
+                    trace_events.append(f'edit_required_reject[{turn}]={payload["content"]}')
+                fallback = None
+                if not fallback_used:
+                    fallback = infer_tool_call_from_prompt(prompt, prefer_edit=True)
+                if fallback is not None:
+                    fallback_used = True
+                    if trace:
+                        trace_events.append(f'fallback_tool[{turn}]={fallback["name"]} {json.dumps(fallback["arguments"], ensure_ascii=True)}')
+                    _append_tool_result(messages, tools, fallback, tool_calls, tool_trace, trace_events if trace else None, turn)
+                    continue
+                messages.append({'role': 'user', 'content': edit_required_message()})
                 continue
             return AgentRunResult(
                 content=payload['content'],
                 turns=turn,
                 tool_calls=tuple(tool_calls),
+                tool_trace=tuple(tool_trace),
+                stop_reason='completed',
                 trace_events=tuple(trace_events),
             )
 
-        _append_tool_result(messages, tools, payload, tool_calls, trace_events if trace else None, turn)
+        _append_tool_result(messages, tools, payload, tool_calls, tool_trace, trace_events if trace else None, turn)
 
     if trace:
         trace_events.append(f'stopped=max_turns:{max_turns}')
@@ -183,6 +205,13 @@ def tool_required_message() -> str:
     )
 
 
+def edit_required_message() -> str:
+    return (
+        'You must make a real workspace change before answering this request. '
+        'A read-only inspection is insufficient. Respond with exactly one JSON tool_call object that performs the edit.'
+    )
+
+
 def prompt_requires_tool(prompt: str) -> bool:
     lowered = prompt.lower()
     action_words = ('read', 'search', 'find', 'inspect', 'open', 'edit', 'modify', 'create', 'write', 'run', 'execute', 'quote')
@@ -190,7 +219,34 @@ def prompt_requires_tool(prompt: str) -> bool:
     return any(word in lowered for word in action_words) and any(hint in lowered for hint in target_hints)
 
 
-def infer_tool_call_from_prompt(prompt: str) -> dict[str, Any] | None:
+def prompt_requires_edit(prompt: str) -> bool:
+    lowered = prompt.lower()
+    edit_words = ('edit', 'modify', 'change', 'update', 'write', 'create', 'add')
+    target_hints = ('.py', '.md', '.txt', 'file', 'workspace', 'train.py', 'src/')
+    return any(word in lowered for word in edit_words) and any(hint in lowered for hint in target_hints)
+
+
+def infer_required_edit_target(prompt: str) -> str | None:
+    match = re.search(
+        r'(?:modify|edit|change|update|write|create|add(?:\s+to)?)\s+(?P<path>[\w./-]+)',
+        prompt,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return match.group('path')
+
+
+def infer_tool_call_from_prompt(prompt: str, prefer_edit: bool = False) -> dict[str, Any] | None:
+    if prefer_edit:
+        edit_fallback = infer_edit_tool_call_from_prompt(prompt)
+        if edit_fallback is not None:
+            return edit_fallback
+
+    edit_fallback = infer_edit_tool_call_from_prompt(prompt)
+    if edit_fallback is not None:
+        return edit_fallback
+
     read_match = re.search(
         r'read\s+(?P<path>[\w./-]+)(?:\s+lines?\s+(?P<start>\d+)\s*(?:to|-)\s*(?P<end>\d+))?',
         prompt,
@@ -239,7 +295,82 @@ def infer_tool_call_from_prompt(prompt: str) -> dict[str, Any] | None:
             },
         }
 
+    if 'git status' in prompt.lower():
+        return {'name': 'git_status', 'arguments': {}}
+
+    if 'git diff' in prompt.lower():
+        return {'name': 'git_diff', 'arguments': {}}
+
+    if 'run tests' in prompt.lower() or 'test suite' in prompt.lower():
+        return {'name': 'run_tests', 'arguments': {}}
+
+    if 'run build' in prompt.lower() or 'build the project' in prompt.lower():
+        return {'name': 'run_build', 'arguments': {}}
+
+    if 'list directory' in prompt.lower() or 'list dir' in prompt.lower():
+        return {'name': 'list_dir', 'arguments': {'path': '.'}}
+
     return None
+
+
+def infer_edit_tool_call_from_prompt(prompt: str) -> dict[str, Any] | None:
+    modify_match = re.search(
+        r'(?:modify|edit|change|update)\s+(?P<path>[\w./-]+)\s+by\s+(?P<details>.+?)(?:\.|\n|$)',
+        prompt,
+        flags=re.IGNORECASE,
+    )
+    if modify_match:
+        path = modify_match.group('path')
+        details = modify_match.group('details').strip().lower()
+        if 'comment' in details:
+            marker = '# smoke-test comment: '
+            command = '\n'.join(
+                [
+                    "python3 - <<'PY'",
+                    'from pathlib import Path',
+                    'import re',
+                    f"target = Path({json.dumps(path)})",
+                    "text = target.read_text(encoding='utf-8')",
+                    f"marker = {json.dumps(marker)}",
+                    "match = re.match(r'^# smoke-test comment: (\\d+)\\n', text)",
+                    'if match:',
+                    '    current = int(match.group(1))',
+                    "    updated = f'{marker}{current + 1}\\n' + text[match.end():]",
+                    'else:',
+                    "    updated = f'{marker}1\\n' + text",
+                    "target.write_text(updated, encoding='utf-8')",
+                    'PY',
+                ]
+            )
+            return {
+                'name': 'run_shell_command',
+                'arguments': {'command': command, 'timeout_seconds': 20},
+            }
+    return None
+
+
+def has_successful_edit(tool_trace: list[dict[str, Any]], required_path: str | None) -> bool:
+    for entry in tool_trace:
+        if not entry.get('success'):
+            continue
+        if entry.get('name') not in MUTATING_TOOL_NAMES:
+            continue
+        metadata = entry.get('metadata')
+        if required_path is None:
+            return True
+        if isinstance(metadata, dict) and metadata.get('path') == required_path:
+            return True
+        arguments = entry.get('arguments')
+        if isinstance(arguments, dict) and arguments.get('path') == required_path:
+            return True
+        if (
+            entry.get('name') == 'run_shell_command'
+            and isinstance(arguments, dict)
+            and isinstance(arguments.get('command'), str)
+            and required_path in arguments['command']
+        ):
+            return True
+    return False
 
 
 def _append_tool_result(
@@ -247,6 +378,7 @@ def _append_tool_result(
     tools: RuntimeToolRegistry,
     payload: dict[str, Any],
     tool_calls: list[str],
+    tool_trace: list[dict[str, Any]],
     trace_events: list[str] | None,
     turn: int,
 ) -> None:
@@ -256,6 +388,17 @@ def _append_tool_result(
     if trace_events is not None:
         trace_events.append(f'tool_call[{turn}]={tool_name} {json.dumps(arguments, ensure_ascii=True)}')
     tool_result = tools.execute(tool_name, arguments)
+    tool_trace.append(
+        {
+            'turn': turn,
+            'name': tool_name,
+            'arguments': arguments,
+            'success': tool_result.success,
+            'output': tool_result.output,
+            'metadata': tool_result.metadata,
+            'error': tool_result.error,
+        }
+    )
     if trace_events is not None:
         trace_events.append(
             f'tool_result[{turn}]={tool_name} success={tool_result.success} '

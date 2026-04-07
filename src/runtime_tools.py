@@ -44,6 +44,14 @@ class RuntimeToolResult:
 
 TOOL_DEFINITIONS = (
     RuntimeToolDefinition(
+        name='list_dir',
+        description='List directory entries inside the workspace root.',
+        arguments={
+            'path': 'Optional workspace-relative directory path. Defaults to the workspace root.',
+            'max_entries': 'Optional cap on returned entries. Defaults to 200.',
+        },
+    ),
+    RuntimeToolDefinition(
         name='read_file',
         description='Read a file from the workspace. Optionally limit the response to a line range.',
         arguments={
@@ -76,6 +84,35 @@ TOOL_DEFINITIONS = (
         arguments={
             'command': 'Shell command string to execute.',
             'timeout_seconds': 'Optional timeout in seconds. Defaults to 20.',
+        },
+    ),
+    RuntimeToolDefinition(
+        name='git_status',
+        description='Show git status for the current workspace.',
+        arguments={},
+    ),
+    RuntimeToolDefinition(
+        name='git_diff',
+        description='Show git diff output, optionally scoped to a path or staged changes.',
+        arguments={
+            'path': 'Optional workspace-relative path to diff.',
+            'staged': 'Optional boolean. When true, show staged diff.',
+        },
+    ),
+    RuntimeToolDefinition(
+        name='run_tests',
+        description='Run the project test command and capture the result.',
+        arguments={
+            'command': 'Optional shell command. Defaults to python3 -m unittest discover -s tests -v.',
+            'timeout_seconds': 'Optional timeout in seconds. Defaults to 120.',
+        },
+    ),
+    RuntimeToolDefinition(
+        name='run_build',
+        description='Run the project build command and capture the result.',
+        arguments={
+            'command': 'Optional shell command. Defaults to python3 -m compileall src.',
+            'timeout_seconds': 'Optional timeout in seconds. Defaults to 120.',
         },
     ),
 )
@@ -111,10 +148,15 @@ class RuntimeToolRegistry:
             )
 
         handlers = {
+            'list_dir': self._list_dir,
             'read_file': self._read_file,
             'search_files': self._search_files,
             'edit_file': self._edit_file,
             'run_shell_command': self._run_shell_command,
+            'git_status': self._git_status,
+            'git_diff': self._git_diff,
+            'run_tests': self._run_tests,
+            'run_build': self._run_build,
         }
         handler = handlers.get(name)
         if handler is None:
@@ -154,6 +196,24 @@ class RuntimeToolRegistry:
                 'end_line': min(end_line, len(lines)) if lines else 0,
                 'line_count': len(lines),
             },
+        )
+
+    def _list_dir(self, arguments: dict[str, Any]) -> RuntimeToolResult:
+        path = self._resolve_path(arguments.get('path', '.'))
+        if not path.exists():
+            raise RuntimeToolError(f'Path not found: {path.relative_to(self.root)}')
+        if not path.is_dir():
+            raise RuntimeToolError(f'Path is not a directory: {path.relative_to(self.root)}')
+        max_entries = self._optional_int(arguments, 'max_entries', minimum=1) or 200
+        entries = []
+        for child in sorted(path.iterdir())[:max_entries]:
+            marker = '[D]' if child.is_dir() else '[F]'
+            entries.append(f'{marker} {child.relative_to(self.root)}')
+        return RuntimeToolResult(
+            name='list_dir',
+            success=True,
+            output='\n'.join(entries),
+            metadata={'path': str(path.relative_to(self.root)), 'entry_count': len(entries)},
         )
 
     def _search_files(self, arguments: dict[str, Any]) -> RuntimeToolResult:
@@ -249,6 +309,62 @@ class RuntimeToolRegistry:
     def _run_shell_command(self, arguments: dict[str, Any]) -> RuntimeToolResult:
         command = self._require_string(arguments, 'command')
         timeout = self._optional_int(arguments, 'timeout_seconds', minimum=1) or 20
+        return self._run_command(
+            name='run_shell_command',
+            command=command,
+            timeout=timeout,
+        )
+
+    def _git_status(self, arguments: dict[str, Any]) -> RuntimeToolResult:
+        del arguments
+        self._ensure_git_repo()
+        return self._run_command(
+            name='git_status',
+            command='git status --short --branch',
+            timeout=20,
+        )
+
+    def _git_diff(self, arguments: dict[str, Any]) -> RuntimeToolResult:
+        self._ensure_git_repo()
+        staged = self._optional_bool(arguments, 'staged') or False
+        path = arguments.get('path')
+        if path is not None and not isinstance(path, str):
+            raise RuntimeToolError('path must be a string when provided.')
+        command_parts = ['git', 'diff']
+        if staged:
+            command_parts.append('--cached')
+        if isinstance(path, str) and path:
+            resolved = self._resolve_path(path)
+            command_parts.extend(['--', str(resolved.relative_to(self.root))])
+        return self._run_command(
+            name='git_diff',
+            command=' '.join(command_parts),
+            timeout=20,
+        )
+
+    def _run_tests(self, arguments: dict[str, Any]) -> RuntimeToolResult:
+        command = arguments.get('command')
+        if command is not None and not isinstance(command, str):
+            raise RuntimeToolError('command must be a string when provided.')
+        timeout = self._optional_int(arguments, 'timeout_seconds', minimum=1) or 120
+        return self._run_command(
+            name='run_tests',
+            command=command or 'python3 -m unittest discover -s tests -v',
+            timeout=timeout,
+        )
+
+    def _run_build(self, arguments: dict[str, Any]) -> RuntimeToolResult:
+        command = arguments.get('command')
+        if command is not None and not isinstance(command, str):
+            raise RuntimeToolError('command must be a string when provided.')
+        timeout = self._optional_int(arguments, 'timeout_seconds', minimum=1) or 120
+        return self._run_command(
+            name='run_build',
+            command=command or 'python3 -m compileall src',
+            timeout=timeout,
+        )
+
+    def _run_command(self, name: str, command: str, timeout: int) -> RuntimeToolResult:
         try:
             result = subprocess.run(
                 [self.shell, '-lc', command],
@@ -265,12 +381,23 @@ class RuntimeToolRegistry:
             part for part in (result.stdout.strip(), result.stderr.strip()) if part
         )
         return RuntimeToolResult(
-            name='run_shell_command',
+            name=name,
             success=result.returncode == 0,
             output=self._truncate(combined),
             metadata={'exit_code': result.returncode, 'command': command, 'timeout_seconds': timeout},
             error=None if result.returncode == 0 else f'Command exited with status {result.returncode}.',
         )
+
+    def _ensure_git_repo(self) -> None:
+        result = subprocess.run(
+            ['git', 'rev-parse', '--is-inside-work-tree'],
+            capture_output=True,
+            text=True,
+            cwd=self.root,
+            check=False,
+        )
+        if result.returncode != 0 or result.stdout.strip() != 'true':
+            raise RuntimeToolError('Workspace root is not inside a git work tree.')
 
     def _resolve_path(self, raw_path: Any) -> Path:
         if not isinstance(raw_path, str) or not raw_path.strip():
@@ -295,6 +422,15 @@ class RuntimeToolRegistry:
         value = arguments[key]
         if not isinstance(value, int) or value < minimum:
             raise RuntimeToolError(f'{key} must be an integer >= {minimum}.')
+        return value
+
+    @staticmethod
+    def _optional_bool(arguments: dict[str, Any], key: str) -> bool | None:
+        if key not in arguments or arguments[key] is None:
+            return None
+        value = arguments[key]
+        if not isinstance(value, bool):
+            raise RuntimeToolError(f'{key} must be a boolean.')
         return value
 
     @staticmethod

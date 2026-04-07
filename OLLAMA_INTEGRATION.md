@@ -12,6 +12,8 @@ The current Ollama integration lives in the Python workspace:
 - [`src/task.py`](./src/task.py): one-shot local chat wrapper
 - [`src/runtime_tools.py`](./src/runtime_tools.py): executable workspace tools
 - [`src/agent_loop.py`](./src/agent_loop.py): multi-turn agent loop with tool use
+- [`src/task_packet.py`](./src/task_packet.py): structured worker task packet contract
+- [`src/worker_api.py`](./src/worker_api.py): persisted worker control-plane API
 - [`src/main.py`](./src/main.py): CLI entrypoints
 
 ## Default Configuration
@@ -132,6 +134,19 @@ If the model returns invalid JSON or tries to answer directly without using a re
 
 The current agent exposes these real tools:
 
+### `list_dir`
+
+Arguments:
+
+- optional `path`
+- optional `max_entries`
+
+Behavior:
+
+- lists directory entries inside the workspace root
+- returns `[D]` and `[F]` records
+- avoids shelling out for basic file discovery
+
 ### `read_file`
 
 Arguments:
@@ -186,6 +201,54 @@ Behavior:
 - runs inside the workspace root
 - captures stdout, stderr, and exit code
 - marks non-zero exit as failure
+
+### `git_status`
+
+Arguments:
+
+- none
+
+Behavior:
+
+- runs `git status --short --branch`
+- fails when the workspace is not a git repo
+
+### `git_diff`
+
+Arguments:
+
+- optional `path`
+- optional `staged`
+
+Behavior:
+
+- runs `git diff`
+- can scope to a path
+- can inspect staged changes
+
+### `run_tests`
+
+Arguments:
+
+- optional `command`
+- optional `timeout_seconds`
+
+Behavior:
+
+- defaults to `python3 -m unittest discover -s tests -v`
+- can be overridden per project or per task
+
+### `run_build`
+
+Arguments:
+
+- optional `command`
+- optional `timeout_seconds`
+
+Behavior:
+
+- defaults to `python3 -m compileall src`
+- can be overridden per project or per task
 
 ## CLI Commands
 
@@ -252,6 +315,51 @@ Expected stderr output looks like:
 [trace] assistant_raw[2]={"type":"final","content":"..."}
 ```
 
+### Structured worker API
+
+Use the `worker` subcommands when you want a manager agent to control a local Ollama worker through machine-readable JSON state.
+
+Create a worker:
+
+```bash
+python3 -m src.main worker create --root .
+```
+
+Run a task packet:
+
+```bash
+python3 -m src.main worker run <worker_id> --packet task.json --trace
+```
+
+Check worker state:
+
+```bash
+python3 -m src.main worker status <worker_id>
+```
+
+Resume the last stored packet:
+
+```bash
+python3 -m src.main worker resume <worker_id> --trace
+```
+
+Close a worker:
+
+```bash
+python3 -m src.main worker close <worker_id>
+```
+
+Worker results are emitted as JSON and include:
+
+- `state`
+- `tool_calls`
+- `tool_trace`
+- `artifacts`
+- `changed_files`
+- `verification`
+- `final_answer`
+- `stop_reason`
+
 ### Deny tools
 
 You can block specific tools or prefixes in agent mode:
@@ -312,6 +420,78 @@ Before building on this integration, verify:
 2. the target model is available locally
 3. `python3 -m src.main chat "hello"` works
 4. `python3 -m src.main agent --trace "read src/main.py lines 1 to 20"` shows a real `tool_call`
+
+## Worker Smoke Test
+
+This is the recommended local smoke test for the structured worker API.
+
+If you prefer a runnable walkthrough, use [`notebooks/ollama_worker_demo.ipynb`](./notebooks/ollama_worker_demo.ipynb). It handles `worker_id` capture automatically.
+
+### 1. Start Ollama and ensure the model exists
+
+```bash
+ollama run qwen2.5-coder:7b
+```
+
+### 2. Create a task packet
+
+Save this as `task.json` in the repo root:
+
+```json
+{
+  "objective": "Inspect the Python CLI and report the worker-related commands.",
+  "scope": "Only inspect src/main.py and related worker modules when needed.",
+  "repo": "claw-code",
+  "branch_policy": "Do not create or switch branches.",
+  "acceptance_tests": [
+    "python3 -m unittest tests/test_porting_workspace.py"
+  ],
+  "commit_policy": "Do not commit.",
+  "reporting_contract": "Report the worker commands, changed files, and verification results.",
+  "escalation_policy": "Stop if Ollama is unavailable or a required tool fails repeatedly."
+}
+```
+
+### 3. Create a worker
+
+```bash
+python3 -m src.main worker create --root .
+```
+
+Copy the `worker_id` from the JSON response.
+
+### 4. Run the worker
+
+```bash
+python3 -m src.main worker run <worker_id> --packet task.json --trace
+```
+
+Success criteria:
+
+- JSON output is returned
+- `last_result.tool_calls` is non-empty
+- `last_result.verification.acceptance_tests` is present
+- `last_result.stop_reason` is `completed` or `verification_failed`
+
+### 5. Inspect worker state
+
+```bash
+python3 -m src.main worker status <worker_id>
+```
+
+### 6. Resume the last packet
+
+```bash
+python3 -m src.main worker resume <worker_id> --trace
+```
+
+### 7. Close the worker
+
+```bash
+python3 -m src.main worker close <worker_id>
+```
+
+If all of those steps work, you have a usable manager/worker foundation for a local Ollama worker node.
 
 ## Example End-to-End Session
 

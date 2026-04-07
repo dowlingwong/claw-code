@@ -1,8 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+from pathlib import Path
 
+from .autoresearch_runner import parse_run_log, setup_autoresearch
+from .autoresearch_worker import (
+    autoresearch_status,
+    discard_autoresearch_candidate,
+    ensure_autoresearch_baseline,
+    ensure_autoresearch_branch,
+    keep_autoresearch_candidate,
+    loop_autoresearch,
+    run_autoresearch_packet,
+)
 from .bootstrap_graph import build_bootstrap_graph
 from .command_graph import build_command_graph
 from .commands import execute_command, get_command, get_commands, render_command_index
@@ -18,6 +30,7 @@ from .runtime import PortRuntime
 from .session_store import load_session
 from .setup import run_setup
 from .task import DEFAULT_SYSTEM_PROMPT, run_local_task
+from .worker_api import close_worker, create_worker, list_workers, load_worker, resume_worker, run_worker
 from .tool_pool import assemble_tool_pool
 from .tools import execute_tool, get_tool, get_tools, render_tool_index
 
@@ -108,6 +121,81 @@ def build_parser() -> argparse.ArgumentParser:
     agent_parser.add_argument('--deny-tool', action='append', default=[])
     agent_parser.add_argument('--deny-prefix', action='append', default=[])
     agent_parser.add_argument('--trace', action='store_true')
+
+    worker_parser = subparsers.add_parser('worker', help='manage structured local Ollama workers')
+    worker_subparsers = worker_parser.add_subparsers(dest='worker_command', required=True)
+
+    worker_create = worker_subparsers.add_parser('create', help='create a worker record')
+    worker_create.add_argument('--root', default='.')
+    worker_create.add_argument('--model', default=DEFAULT_OLLAMA_MODEL)
+    worker_create.add_argument('--host', default=DEFAULT_OLLAMA_HOST)
+
+    worker_subparsers.add_parser('list', help='list stored worker records')
+
+    worker_run = worker_subparsers.add_parser('run', help='run a task packet on a worker')
+    worker_run.add_argument('worker_id')
+    worker_run.add_argument('--packet', required=True)
+    worker_run.add_argument('--trace', action='store_true')
+
+    worker_status = worker_subparsers.add_parser('status', help='show worker state')
+    worker_status.add_argument('worker_id')
+
+    worker_resume = worker_subparsers.add_parser('resume', help='rerun the last stored task packet')
+    worker_resume.add_argument('worker_id')
+    worker_resume.add_argument('--trace', action='store_true')
+
+    worker_close = worker_subparsers.add_parser('close', help='close a worker record')
+    worker_close.add_argument('worker_id')
+
+    autoresearch_parser = subparsers.add_parser('autoresearch', help='project-specific control plane for autoresearch experiments')
+    autoresearch_subparsers = autoresearch_parser.add_subparsers(dest='autoresearch_command', required=True)
+
+    autoresearch_setup = autoresearch_subparsers.add_parser('setup', help='verify autoresearch repo state and initialize results.tsv')
+    autoresearch_setup.add_argument('--root')
+    autoresearch_setup.add_argument('--no-init-results', action='store_true')
+
+    autoresearch_run = autoresearch_subparsers.add_parser('run', help='run one autoresearch experiment packet through the worker + experiment runner')
+    autoresearch_run.add_argument('--root')
+    autoresearch_run.add_argument('--packet', required=True)
+    autoresearch_run.add_argument('--model', default=DEFAULT_OLLAMA_MODEL)
+    autoresearch_run.add_argument('--host', default=DEFAULT_OLLAMA_HOST)
+    autoresearch_run.add_argument('--trace', action='store_true')
+
+    autoresearch_status_parser = autoresearch_subparsers.add_parser('status', help='show current autoresearch control-plane state')
+    autoresearch_status_parser.add_argument('--root')
+
+    autoresearch_baseline = autoresearch_subparsers.add_parser('baseline', help='record the baseline experiment if results.tsv is still empty')
+    autoresearch_baseline.add_argument('--root')
+    autoresearch_baseline.add_argument('--command', dest='train_command', default='uv run train.py > run.log 2>&1')
+    autoresearch_baseline.add_argument('--log-path', default='run.log')
+    autoresearch_baseline.add_argument('--results-tsv', default='results.tsv')
+    autoresearch_baseline.add_argument('--timeout-seconds', type=int, default=600)
+
+    autoresearch_keep = autoresearch_subparsers.add_parser('keep', help='finalize the pending autoresearch candidate as keep')
+    autoresearch_keep.add_argument('--root')
+
+    autoresearch_discard = autoresearch_subparsers.add_parser('discard', help='finalize the pending autoresearch candidate as discard or crash')
+    autoresearch_discard.add_argument('--root')
+
+    autoresearch_isolate = autoresearch_subparsers.add_parser('isolate', help='create or switch to an autoresearch/<tag> branch')
+    autoresearch_isolate.add_argument('--root')
+    autoresearch_isolate.add_argument('--branch')
+    autoresearch_isolate.add_argument('--create', action='store_true')
+    autoresearch_isolate.add_argument('--from-ref', default='HEAD')
+
+    autoresearch_loop = autoresearch_subparsers.add_parser('loop', help='run repeated autoresearch iterations with automatic baseline and keep/discard decisions')
+    autoresearch_loop.add_argument('--root')
+    autoresearch_loop.add_argument('--packet', required=True)
+    autoresearch_loop.add_argument('--model', default=DEFAULT_OLLAMA_MODEL)
+    autoresearch_loop.add_argument('--host', default=DEFAULT_OLLAMA_HOST)
+    autoresearch_loop.add_argument('--iterations', type=int, default=1)
+    autoresearch_loop.add_argument('--retry-limit', type=int, default=1)
+    autoresearch_loop.add_argument('--allow-any-branch', action='store_true')
+    autoresearch_loop.add_argument('--trace', action='store_true')
+
+    autoresearch_parse_log = autoresearch_subparsers.add_parser('parse-log', help='parse a train.py run log into machine-readable metrics')
+    autoresearch_parse_log.add_argument('--root')
+    autoresearch_parse_log.add_argument('log_path')
     return parser
 
 
@@ -272,6 +360,105 @@ def main(argv: list[str] | None = None) -> int:
             print(error, file=sys.stderr)
             return 1
         return 0
+    if args.command == 'worker':
+        try:
+            if args.worker_command == 'list':
+                workers = list_workers()
+                print(json.dumps([worker.to_dict() for worker in workers], indent=2))
+                return 0
+            if args.worker_command == 'create':
+                worker = create_worker(root=args.root, model=args.model, host=args.host)
+                print(json.dumps(worker.to_dict(), indent=2))
+                return 0
+            if args.worker_command == 'run':
+                worker = run_worker(args.worker_id, args.packet, trace=args.trace)
+                print(json.dumps(worker.to_dict(), indent=2))
+                return 0
+            if args.worker_command == 'status':
+                worker = load_worker(args.worker_id)
+                print(json.dumps(worker.to_dict(), indent=2))
+                return 0
+            if args.worker_command == 'resume':
+                worker = resume_worker(args.worker_id, trace=args.trace)
+                print(json.dumps(worker.to_dict(), indent=2))
+                return 0
+            if args.worker_command == 'close':
+                worker = close_worker(args.worker_id)
+                print(json.dumps(worker.to_dict(), indent=2))
+                return 0
+        except Exception as error:
+            print(error, file=sys.stderr)
+            return 1
+    if args.command == 'autoresearch':
+        try:
+            if args.autoresearch_command == 'setup':
+                report = setup_autoresearch(
+                    root=args.root,
+                    initialize_results=not args.no_init_results,
+                )
+                print(json.dumps(report.to_dict(), indent=2))
+                return 0
+            if args.autoresearch_command == 'run':
+                result = run_autoresearch_packet(
+                    args.packet,
+                    root=args.root,
+                    model=args.model,
+                    host=args.host,
+                    trace=args.trace,
+                )
+                print(json.dumps(result, indent=2))
+                return 0
+            if args.autoresearch_command == 'status':
+                print(json.dumps(autoresearch_status(root=args.root), indent=2))
+                return 0
+            if args.autoresearch_command == 'baseline':
+                result = ensure_autoresearch_baseline(
+                    root=args.root,
+                    command=args.train_command,
+                    log_path=args.log_path,
+                    results_tsv=args.results_tsv,
+                    timeout_seconds=args.timeout_seconds,
+                )
+                print(json.dumps(result, indent=2))
+                return 0
+            if args.autoresearch_command == 'keep':
+                print(json.dumps(keep_autoresearch_candidate(root=args.root), indent=2))
+                return 0
+            if args.autoresearch_command == 'discard':
+                print(json.dumps(discard_autoresearch_candidate(root=args.root), indent=2))
+                return 0
+            if args.autoresearch_command == 'isolate':
+                result = ensure_autoresearch_branch(
+                    root=args.root,
+                    branch=args.branch,
+                    create=args.create,
+                    from_ref=args.from_ref,
+                )
+                print(json.dumps(result, indent=2))
+                return 0
+            if args.autoresearch_command == 'loop':
+                result = loop_autoresearch(
+                    args.packet,
+                    root=args.root,
+                    model=args.model,
+                    host=args.host,
+                    iterations=args.iterations,
+                    retry_limit=args.retry_limit,
+                    require_isolated_branch=not args.allow_any_branch,
+                    trace=args.trace,
+                )
+                print(json.dumps(result, indent=2))
+                return 0
+            if args.autoresearch_command == 'parse-log':
+                log_path = args.log_path
+                if not Path(log_path).is_absolute() and args.root:
+                    log_path = str(Path(args.root) / log_path)
+                metrics = parse_run_log(log_path)
+                print(json.dumps(metrics.to_dict(), indent=2))
+                return 0
+        except Exception as error:
+            print(error, file=sys.stderr)
+            return 1
     parser.error(f'unknown command: {args.command}')
     return 2
 

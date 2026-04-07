@@ -1,0 +1,9 @@
+{
+  "objective": "Modify train.py by incrementing or inserting a harmless smoke-test comment counter near the top of the file. You must change train.py on every run. A no-op is failure.",
+  "description": "Increment the smoke-test comment counter in train.py.",
+  "train_command": "python3 -c 'from pathlib import Path; Path('\"'\"'run.log'\"'\"').write_text('\"'\"'---\\nval_bpb:          0.998000\\ntraining_seconds: 300.0\\ntotal_seconds:    320.0\\npeak_vram_mb:     1024.0\\nmfu_percent:      10.00\\ntotal_tokens_M:   1.0\\nnum_steps:        1\\nnum_params_M:     1.0\\ndepth:            1\\n'\"'\"', encoding='\"'\"'utf-8'\"'\"')'",
+  "timeout_seconds": 30,
+  "log_path": "run.log",
+  "results_tsv": "results.tsv",
+  "syntax_check_command": "python3 -m py_compile train.py"
+}

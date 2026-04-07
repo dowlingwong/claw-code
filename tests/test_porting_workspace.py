@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import subprocess
 import sys
 import unittest
@@ -9,9 +10,13 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from src.agent_loop import (
+    AgentRunResult,
     build_agent_messages,
+    has_successful_edit,
     infer_tool_call_from_prompt,
+    infer_required_edit_target,
     parse_agent_response,
+    prompt_requires_edit,
     prompt_requires_tool,
     run_agent_task,
     tool_result_message,
@@ -23,7 +28,9 @@ from src.port_manifest import build_port_manifest
 from src.query_engine import QueryEnginePort
 from src.runtime_tools import RuntimeToolRegistry
 from src.task import DEFAULT_SYSTEM_PROMPT, build_chat_messages, run_local_task
+from src.task_packet import TaskPacket, TaskPacketValidationError, load_task_packet
 from src.tools import PORTED_TOOLS
+from src.worker_api import close_worker, create_worker, list_workers, load_worker, resume_worker, run_worker
 
 
 class PortingWorkspaceTests(unittest.TestCase):
@@ -313,6 +320,38 @@ class PortingWorkspaceTests(unittest.TestCase):
             self.assertTrue(shell_result.success)
             self.assertEqual(shell_result.output, 'shell-ok')
 
+    def test_runtime_tool_registry_supports_list_dir_git_build_and_test(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / 'src').mkdir()
+            (root / 'src' / 'app.py').write_text('print("ok")\n', encoding='utf-8')
+            subprocess.run(['git', 'init'], cwd=root, check=True, capture_output=True, text=True)
+            subprocess.run(['git', 'config', 'user.email', 'test@example.com'], cwd=root, check=True, capture_output=True, text=True)
+            subprocess.run(['git', 'config', 'user.name', 'Test User'], cwd=root, check=True, capture_output=True, text=True)
+            subprocess.run(['git', 'add', '.'], cwd=root, check=True, capture_output=True, text=True)
+            subprocess.run(['git', 'commit', '-m', 'init'], cwd=root, check=True, capture_output=True, text=True)
+            (root / 'src' / 'app.py').write_text('print("changed")\n', encoding='utf-8')
+            registry = RuntimeToolRegistry(root=root)
+
+            list_result = registry.execute('list_dir', {'path': 'src'})
+            self.assertTrue(list_result.success)
+            self.assertIn('[F] src/app.py', list_result.output)
+
+            git_status = registry.execute('git_status', {})
+            self.assertTrue(git_status.success)
+            self.assertIn('src/app.py', git_status.output)
+
+            git_diff = registry.execute('git_diff', {'path': 'src/app.py'})
+            self.assertTrue(git_diff.success)
+            self.assertIn('-print("ok")', git_diff.output)
+
+            run_build = registry.execute('run_build', {'command': 'python3 -m compileall src'})
+            self.assertTrue(run_build.success)
+
+            run_tests = registry.execute('run_tests', {'command': 'python3 -c "print(\'tests ok\')"', 'timeout_seconds': 30})
+            self.assertTrue(run_tests.success)
+            self.assertIn('tests ok', run_tests.output)
+
     def test_parse_agent_response_supports_tool_calls_and_finals(self) -> None:
         tool_call = parse_agent_response('{"type":"tool_call","name":"read_file","arguments":{"path":"src/main.py"}}')
         final = parse_agent_response('{"type":"final","content":"done"}')
@@ -324,11 +363,39 @@ class PortingWorkspaceTests(unittest.TestCase):
         self.assertTrue(prompt_requires_tool("search the src tree for 'agent_parser'"))
         self.assertFalse(prompt_requires_tool('say hello'))
 
+    def test_prompt_requires_edit_for_mutating_prompts(self) -> None:
+        self.assertTrue(prompt_requires_edit('modify train.py by adding a single harmless comment line near the top of the file'))
+        self.assertFalse(prompt_requires_edit('read train.py for context'))
+        self.assertEqual(
+            infer_required_edit_target('modify train.py by adding a single harmless comment line near the top of the file'),
+            'train.py',
+        )
+
     def test_infer_tool_call_from_prompt_recognizes_read_and_search(self) -> None:
         read_call = infer_tool_call_from_prompt('read src/main.py lines 1 to 40')
         search_call = infer_tool_call_from_prompt("search the src tree for 'agent_parser'")
         self.assertEqual(read_call, {'name': 'read_file', 'arguments': {'path': 'src/main.py', 'start_line': 1, 'end_line': 40}})
         self.assertEqual(search_call, {'name': 'search_files', 'arguments': {'path': 'src', 'pattern': 'agent_parser'}})
+
+    def test_infer_tool_call_from_prompt_recognizes_comment_edit_fallback(self) -> None:
+        tool_call = infer_tool_call_from_prompt(
+            'modify train.py by adding a single harmless comment line near the top of the file',
+            prefer_edit=True,
+        )
+        self.assertIsNotNone(tool_call)
+        self.assertEqual(tool_call['name'], 'run_shell_command')
+        self.assertIn('target = Path("train.py")', tool_call['arguments']['command'])
+        self.assertIn('# smoke-test comment: ', tool_call['arguments']['command'])
+
+    def test_infer_tool_call_from_prompt_recognizes_incrementing_comment_prompt(self) -> None:
+        tool_call = infer_tool_call_from_prompt(
+            'Modify train.py by incrementing or inserting a harmless smoke-test comment counter near the top of the file. You must change train.py on every run. A no-op is failure.',
+            prefer_edit=True,
+        )
+        self.assertIsNotNone(tool_call)
+        self.assertEqual(tool_call['name'], 'run_shell_command')
+        self.assertIn('target = Path("train.py")', tool_call['arguments']['command'])
+        self.assertIn('# smoke-test comment: ', tool_call['arguments']['command'])
 
     def test_tool_result_message_is_json_prefixed(self) -> None:
         message = tool_result_message({'name': 'read_file', 'success': True, 'output': 'ok'})
@@ -366,7 +433,9 @@ class PortingWorkspaceTests(unittest.TestCase):
 
             self.assertEqual(result.content, 'Read complete.')
             self.assertEqual(result.tool_calls, ('read_file',))
+            self.assertEqual(result.stop_reason, 'completed')
             self.assertTrue(any(event.startswith('tool_call') for event in result.trace_events))
+            self.assertEqual(result.tool_trace[0]['name'], 'read_file')
             second_call_messages = chat_mock.call_args_list[1].args[0]
             self.assertTrue(any(message['content'].startswith('TOOL_RESULT ') for message in second_call_messages if message['role'] == 'user'))
 
@@ -396,6 +465,219 @@ class PortingWorkspaceTests(unittest.TestCase):
             self.assertEqual(result.content, 'Read complete after tool use.')
             self.assertEqual(result.tool_calls, ('read_file',))
             self.assertTrue(any('tool_required_reject' in event for event in result.trace_events))
+
+    def test_run_agent_task_requires_mutation_for_edit_prompt(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            target = root / 'train.py'
+            target.write_text('print("ok")\n', encoding='utf-8')
+            responses = [
+                normalize_ollama_response(
+                    {
+                        'message': {
+                            'content': '{"type":"tool_call","name":"read_file","arguments":{"path":"train.py"}}'
+                        }
+                    }
+                ),
+                normalize_ollama_response(
+                    {
+                        'message': {
+                            'content': '{"type":"final","content":"I reviewed the file."}'
+                        }
+                    }
+                ),
+                normalize_ollama_response(
+                    {
+                        'message': {
+                            'content': '{"type":"final","content":"Inserted the comment."}'
+                        }
+                    }
+                ),
+            ]
+            with patch('src.agent_loop.OllamaBackend.chat', side_effect=responses):
+                result = run_agent_task(
+                    'modify train.py by adding a single harmless comment line near the top of the file',
+                    root=root,
+                    max_turns=4,
+                    trace=True,
+                )
+
+            self.assertIn('# smoke-test comment: 1', target.read_text(encoding='utf-8'))
+            self.assertEqual(result.tool_calls, ('read_file', 'run_shell_command'))
+            self.assertTrue(any('edit_required_reject' in event for event in result.trace_events))
+
+    def test_run_agent_task_incrementing_smoke_comment_is_repeatable(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            target = root / 'train.py'
+            target.write_text('# smoke-test comment: 1\nprint("ok")\n', encoding='utf-8')
+            responses = [
+                normalize_ollama_response(
+                    {
+                        'message': {
+                            'content': '{"type":"tool_call","name":"read_file","arguments":{"path":"train.py"}}'
+                        }
+                    }
+                ),
+                normalize_ollama_response(
+                    {
+                        'message': {
+                            'content': '{"type":"final","content":"I reviewed the file."}'
+                        }
+                    }
+                ),
+                normalize_ollama_response(
+                    {
+                        'message': {
+                            'content': '{"type":"final","content":"Updated the smoke comment."}'
+                        }
+                    }
+                ),
+            ]
+            with patch('src.agent_loop.OllamaBackend.chat', side_effect=responses):
+                run_agent_task(
+                    'modify train.py by adding a single harmless comment line near the top of the file',
+                    root=root,
+                    max_turns=4,
+                    trace=True,
+                )
+
+            self.assertTrue(target.read_text(encoding='utf-8').startswith('# smoke-test comment: 2\n'))
+
+    def test_has_successful_edit_requires_target_path(self) -> None:
+        tool_trace = [
+            {
+                'name': 'edit_file',
+                'success': False,
+                'arguments': {'path': 'program.md'},
+                'metadata': {'path': 'program.md'},
+            },
+            {
+                'name': 'run_shell_command',
+                'success': True,
+                'arguments': {'command': 'echo ok'},
+                'metadata': {'path': 'program.md'},
+            },
+        ]
+        self.assertFalse(has_successful_edit(tool_trace, 'train.py'))
+        self.assertTrue(has_successful_edit(tool_trace, 'program.md'))
+
+    def test_task_packet_load_and_validation(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            packet_path = Path(tmpdir) / 'task.json'
+            packet_path.write_text(
+                (
+                    '{'
+                    '"objective":"Update docs",'
+                    '"scope":"README only",'
+                    '"repo":"claw-code",'
+                    '"branch_policy":"stay on current branch",'
+                    '"acceptance_tests":["python3 -m unittest discover -s tests -v"],'
+                    '"commit_policy":"no commit",'
+                    '"reporting_contract":"report changed files",'
+                    '"escalation_policy":"stop on ambiguity"'
+                    '}'
+                ),
+                encoding='utf-8',
+            )
+            packet = load_task_packet(packet_path)
+            self.assertEqual(packet.objective, 'Update docs')
+            self.assertEqual(packet.acceptance_tests, ('python3 -m unittest discover -s tests -v',))
+
+    def test_task_packet_rejects_missing_fields(self) -> None:
+        with self.assertRaises(TaskPacketValidationError):
+            TaskPacket.from_dict(
+                {
+                    'objective': '',
+                    'scope': '',
+                    'repo': '',
+                    'branch_policy': '',
+                    'acceptance_tests': ['ok', ''],
+                    'commit_policy': '',
+                    'reporting_contract': '',
+                    'escalation_policy': '',
+                }
+            )
+
+    def test_worker_create_run_resume_status_and_close(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            storage = root / '.workers'
+            packet_path = root / 'task.json'
+            packet = {
+                'objective': 'Create a note',
+                'scope': 'workspace root',
+                'repo': 'temp-repo',
+                'branch_policy': 'stay on current branch',
+                'acceptance_tests': ['python3 -c "print(\'verify ok\')"'],
+                'commit_policy': 'no commit',
+                'reporting_contract': 'report changed files',
+                'escalation_policy': 'stop on errors',
+            }
+            packet_path.write_text(json.dumps(packet), encoding='utf-8')
+
+            worker = create_worker(root=root, directory=storage)
+            self.assertEqual(worker.state, 'ready')
+
+            fake_result = AgentRunResult(
+                content='Created notes.txt',
+                turns=2,
+                tool_calls=('edit_file',),
+                tool_trace=(
+                    {
+                        'turn': 1,
+                        'name': 'edit_file',
+                        'arguments': {'path': 'notes.txt', 'new_text': 'hello'},
+                        'success': True,
+                        'output': 'Updated notes.txt',
+                        'metadata': {'path': 'notes.txt', 'created': True},
+                        'error': None,
+                    },
+                ),
+                stop_reason='completed',
+                trace_events=('tool_call[1]=edit_file {"path":"notes.txt"}',),
+            )
+            with patch('src.worker_api.run_agent_task', return_value=fake_result):
+                ran = run_worker(worker.worker_id, packet_path, directory=storage, trace=True)
+
+            self.assertEqual(ran.state, 'finished')
+            self.assertEqual(ran.last_result['stop_reason'], 'completed')
+            self.assertIn('notes.txt', ran.last_result['changed_files'])
+            self.assertTrue(ran.last_result['verification']['acceptance_tests'][0]['success'])
+
+            status = load_worker(worker.worker_id, directory=storage)
+            self.assertEqual(status.worker_id, worker.worker_id)
+            self.assertIsNotNone(status.last_packet)
+
+            with patch('src.worker_api.run_agent_task', return_value=fake_result):
+                resumed = resume_worker(worker.worker_id, directory=storage, trace=False)
+            self.assertEqual(resumed.run_count, 2)
+
+            workers = list_workers(directory=storage)
+            self.assertEqual(len(workers), 1)
+            self.assertEqual(workers[0].worker_id, worker.worker_id)
+
+            closed = close_worker(worker.worker_id, directory=storage)
+            self.assertEqual(closed.state, 'closed')
+
+    def test_worker_cli_create_and_status(self) -> None:
+        from src.main import main
+
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with patch('src.main.create_worker') as create_worker_mock:
+                create_worker_mock.return_value = create_worker(root=root, directory=root / '.workers')
+                with patch('sys.stdout', new=io.StringIO()):
+                    exit_code = main(['worker', 'create', '--root', str(root)])
+            self.assertEqual(exit_code, 0)
+
+    def test_worker_cli_list(self) -> None:
+        from src.main import main
+
+        with patch('src.main.list_workers', return_value=[]):
+            with patch('sys.stdout', new=io.StringIO()):
+                exit_code = main(['worker', 'list'])
+        self.assertEqual(exit_code, 0)
 
     def test_agent_cli_invokes_agent_loop(self) -> None:
         from src.main import main
