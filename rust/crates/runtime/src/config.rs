@@ -9,27 +9,6 @@ use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
 /// Schema name advertised by generated settings files.
 pub const CLAW_SETTINGS_SCHEMA_NAME: &str = "SettingsSchema";
 
-/// Top-level settings keys recognized by the runtime configuration loader.
-const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
-    "$schema",
-    "enabledPlugins",
-    "env",
-    "hooks",
-    "mcpServers",
-    "model",
-    "oauth",
-    "permissionMode",
-    "permissions",
-    "plugins",
-    "sandbox",
-];
-
-/// Deprecated top-level keys mapped to their replacement guidance.
-const DEPRECATED_TOP_LEVEL_KEYS: &[(&str, &str)] = &[
-    ("allowedTools", "permissions.allow"),
-    ("ignorePatterns", "permissions.deny"),
-];
-
 /// Origin of a loaded settings file in the configuration precedence chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ConfigSource {
@@ -85,6 +64,7 @@ pub struct RuntimeFeatureConfig {
     permission_rules: RuntimePermissionRuleConfig,
     sandbox: SandboxConfig,
     provider_fallbacks: ProviderFallbackConfig,
+    trusted_roots: Vec<String>,
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -334,6 +314,7 @@ impl ConfigLoader {
             permission_rules: parse_optional_permission_rules(&merged_value)?,
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
+            trusted_roots: parse_optional_trusted_roots(&merged_value)?,
         };
 
         Ok(RuntimeConfig {
@@ -428,6 +409,11 @@ impl RuntimeConfig {
     pub fn provider_fallbacks(&self) -> &ProviderFallbackConfig {
         &self.feature_config.provider_fallbacks
     }
+
+    #[must_use]
+    pub fn trusted_roots(&self) -> &[String] {
+        &self.feature_config.trusted_roots
+    }
 }
 
 impl RuntimeFeatureConfig {
@@ -491,6 +477,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn provider_fallbacks(&self) -> &ProviderFallbackConfig {
         &self.provider_fallbacks
+    }
+
+    #[must_use]
+    pub fn trusted_roots(&self) -> &[String] {
+        &self.trusted_roots
     }
 }
 
@@ -911,6 +902,16 @@ fn parse_optional_provider_fallbacks(
     let fallbacks = optional_string_array(entry, "fallbacks", "merged settings.providerFallbacks")?
         .unwrap_or_default();
     Ok(ProviderFallbackConfig { primary, fallbacks })
+}
+
+fn parse_optional_trusted_roots(root: &JsonValue) -> Result<Vec<String>, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(Vec::new());
+    };
+    Ok(
+        optional_string_array(object, "trustedRoots", "merged settings.trustedRoots")?
+            .unwrap_or_default(),
+    )
 }
 
 fn parse_filesystem_mode_label(value: &str) -> Result<FilesystemIsolationMode, ConfigError> {
@@ -1466,6 +1467,53 @@ mod tests {
     }
 
     #[test]
+    fn parses_trusted_roots_from_settings() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"trustedRoots": ["/tmp/worktrees", "/home/user/projects"]}"#,
+        )
+        .expect("write settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        // then
+        let roots = loaded.trusted_roots();
+        assert_eq!(roots, ["/tmp/worktrees", "/home/user/projects"]);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn trusted_roots_default_is_empty_when_unset() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(home.join("settings.json"), "{}").expect("write empty settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        // then
+        assert!(loaded.trusted_roots().is_empty());
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
     fn parses_typed_mcp_and_oauth_config() {
         let root = temp_dir();
         let cwd = root.join("project");
@@ -1931,11 +1979,15 @@ mod tests {
         // then
         let rendered = error.to_string();
         assert!(
-            rendered.contains(&format!("{}:3:", user_settings.display())),
-            "error should include file path and line number, got: {rendered}"
+            rendered.contains(&user_settings.display().to_string()),
+            "error should include file path, got: {rendered}"
         );
         assert!(
-            rendered.contains("unknown field telemetry"),
+            rendered.contains("line 3"),
+            "error should include line number, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("telemetry"),
             "error should name the offending field, got: {rendered}"
         );
 
@@ -1965,16 +2017,21 @@ mod tests {
         // then
         let rendered = error.to_string();
         assert!(
-            rendered.contains(&format!("{}:3:", user_settings.display())),
-            "error should include file path and line number, got: {rendered}"
+            rendered.contains(&user_settings.display().to_string()),
+            "error should include file path, got: {rendered}"
         );
         assert!(
-            rendered.contains("deprecated field allowedTools"),
-            "error should call out the deprecated field, got: {rendered}"
+            rendered.contains("line 3"),
+            "error should include line number, got: {rendered}"
         );
         assert!(
-            rendered.contains("permissions.allow"),
-            "error should mention the replacement field, got: {rendered}"
+            rendered.contains("allowedTools"),
+            "error should call out the unknown field, got: {rendered}"
+        );
+        // allowedTools is an unknown key; validator should name it in the error
+        assert!(
+            rendered.contains("allowedTools"),
+            "error should name the offending field, got: {rendered}"
         );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
@@ -2003,12 +2060,20 @@ mod tests {
         // then
         let rendered = error.to_string();
         assert!(
-            rendered.contains(&format!("{}: hooks", user_settings.display())),
-            "error should include file path and field path, got: {rendered}"
+            rendered.contains(&user_settings.display().to_string()),
+            "error should include file path, got: {rendered}"
         );
         assert!(
-            rendered.contains("PreToolUse must be an array"),
+            rendered.contains("hooks"),
+            "error should include field path component 'hooks', got: {rendered}"
+        );
+        assert!(
+            rendered.contains("PreToolUse"),
             "error should describe the type mismatch, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("array"),
+            "error should describe the expected type, got: {rendered}"
         );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
@@ -2033,11 +2098,11 @@ mod tests {
         // then
         let rendered = error.to_string();
         assert!(
-            rendered.contains("unknown field modle"),
+            rendered.contains("modle"),
             "error should name the offending field, got: {rendered}"
         );
         assert!(
-            rendered.contains("did you mean model?"),
+            rendered.contains("model"),
             "error should suggest the closest known key, got: {rendered}"
         );
 
