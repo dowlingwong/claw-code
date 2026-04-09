@@ -185,6 +185,18 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         name: "env",
         expected: FieldType::Object,
     },
+    FieldSpec {
+        name: "aliases",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "providerFallbacks",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "trustedRoots",
+        expected: FieldType::StringArray,
+    },
 ];
 
 const HOOKS_FIELDS: &[FieldSpec] = &[
@@ -364,6 +376,8 @@ fn validate_object_keys(
                     },
                 });
             }
+        } else if DEPRECATED_FIELDS.iter().any(|d| d.name == key) {
+            // Deprecated key — handled separately, not an unknown-key error.
         } else {
             // Unknown key.
             let suggestion = suggest_field(key, &known_names);
