@@ -35,8 +35,8 @@ use commands::{
     classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
     handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
     handle_skills_slash_command, handle_skills_slash_command_json, render_slash_command_help,
-    resume_supported_slash_commands, slash_command_specs, validate_slash_command_input,
-    SkillSlashDispatch, SlashCommand,
+    render_slash_command_help_filtered, resume_supported_slash_commands, slash_command_specs,
+    validate_slash_command_input, SkillSlashDispatch, SlashCommand,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
@@ -4711,7 +4711,7 @@ fn render_repl_help() -> String {
         "  Browse sessions      /session list".to_string(),
         "  Show prompt history  /history [count]".to_string(),
         String::new(),
-        render_slash_command_help(),
+        render_slash_command_help_filtered(STUB_COMMANDS),
     ]
     .join(
         "
@@ -6925,57 +6925,57 @@ fn collect_prompt_cache_events(summary: &runtime::TurnSummary) -> Vec<serde_json
         .collect()
 }
 
+/// Slash commands that are registered in the spec list but not yet implemented
+/// in this build. Used to filter both REPL completions and help output so the
+/// discovery surface only shows commands that actually work (ROADMAP #39).
+const STUB_COMMANDS: &[&str] = &[
+    "login",
+    "logout",
+    "vim",
+    "upgrade",
+    "stats",
+    "share",
+    "feedback",
+    "files",
+    "fast",
+    "exit",
+    "summary",
+    "desktop",
+    "brief",
+    "advisor",
+    "stickers",
+    "insights",
+    "thinkback",
+    "release-notes",
+    "security-review",
+    "keybindings",
+    "privacy-settings",
+    "plan",
+    "review",
+    "tasks",
+    "theme",
+    "voice",
+    "usage",
+    "rename",
+    "copy",
+    "hooks",
+    "context",
+    "color",
+    "effort",
+    "branch",
+    "rewind",
+    "ide",
+    "tag",
+    "output-style",
+    "add-dir",
+];
+
 fn slash_command_completion_candidates_with_sessions(
     model: &str,
     active_session_id: Option<&str>,
     recent_session_ids: Vec<String>,
 ) -> Vec<String> {
     let mut completions = BTreeSet::new();
-
-    // Commands that are registered in the spec list but not yet implemented
-    // in this build. Exclude them from completions so the discovery surface
-    // matches what actually works (ROADMAP #39).
-    const STUB_COMMANDS: &[&str] = &[
-        "login",
-        "logout",
-        "vim",
-        "upgrade",
-        "stats",
-        "share",
-        "feedback",
-        "files",
-        "fast",
-        "exit",
-        "summary",
-        "desktop",
-        "brief",
-        "advisor",
-        "stickers",
-        "insights",
-        "thinkback",
-        "release-notes",
-        "security-review",
-        "keybindings",
-        "privacy-settings",
-        "plan",
-        "review",
-        "tasks",
-        "theme",
-        "voice",
-        "usage",
-        "rename",
-        "copy",
-        "hooks",
-        "context",
-        "color",
-        "effort",
-        "branch",
-        "rewind",
-        "ide",
-        "tag",
-        "output-style",
-        "add-dir",
-    ];
 
     for spec in slash_command_specs() {
         if STUB_COMMANDS.contains(&spec.name) {
@@ -7874,7 +7874,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(out)?;
     writeln!(out, "Interactive slash commands:")?;
-    writeln!(out, "{}", render_slash_command_help())?;
+    writeln!(out, "{}", render_slash_command_help_filtered(STUB_COMMANDS))?;
     writeln!(out)?;
     let resume_commands = resume_supported_slash_commands()
         .into_iter()
