@@ -1,0 +1,41 @@
+{
+  "worker_id": "447c82a04be0448fbea494c501fd9529",
+  "root": "/Users/wongdowling/Documents/autoresearch_harness/harness/claw-code",
+  "model": "qwen2.5-coder:7b",
+  "host": "http://localhost:11434",
+  "state": "closed",
+  "created_at": "2026-04-08T01:07:05Z",
+  "updated_at": "2026-04-08T01:08:22Z",
+  "run_count": 2,
+  "last_packet": {
+    "objective": "Inspect the Python CLI and report the worker-related commands.",
+    "scope": "Inspect src/main.py and worker modules only when needed.",
+    "repo": "claw-code",
+    "branch_policy": "Do not create or switch branches.",
+    "acceptance_tests": [
+      "python3 -m unittest tests/test_porting_workspace.py"
+    ],
+    "commit_policy": "Do not commit.",
+    "reporting_contract": "Report worker commands, changed files, verification results, and blockers.",
+    "escalation_policy": "Stop if Ollama is unavailable or a required tool fails repeatedly."
+  },
+  "last_result": {
+    "worker_id": "447c82a04be0448fbea494c501fd9529",
+    "state": "failed",
+    "tool_calls": [],
+    "tool_trace": [],
+    "artifacts": [],
+    "changed_files": [],
+    "verification": {
+      "acceptance_tests": [],
+      "tool_runs": {
+        "run_tests": [],
+        "run_build": []
+      }
+    },
+    "final_answer": "",
+    "stop_reason": "error",
+    "error": "Agent stopped after reaching max_turns=8."
+  },
+  "last_error": "Agent stopped after reaching max_turns=8."
+}

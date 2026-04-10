@@ -202,8 +202,9 @@ Local project settings override user-level settings. Aliases resolve through the
 
 1. If the resolved model name starts with `claude` → Anthropic.
 2. If it starts with `grok` → xAI.
-3. Otherwise, `claw` checks which credential is set: `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` first, then `OPENAI_API_KEY`, then `XAI_API_KEY`.
-4. If nothing matches, it defaults to Anthropic.
+3. Otherwise, an explicit `OPENAI_BASE_URL` wins and routes the request through the OpenAI-compatible backend. This is how local Ollama/OpenRouter-style model names like `qwen2.5-coder:7b` are forced onto `/v1/chat/completions` even if Anthropic login state exists.
+4. If no explicit OpenAI-compatible base URL is set, `claw` checks which credential is set: `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` (or saved Anthropic OAuth), then `OPENAI_API_KEY`, then `XAI_API_KEY`.
+5. If nothing matches, it defaults to Anthropic.
 
 ## FAQ
 

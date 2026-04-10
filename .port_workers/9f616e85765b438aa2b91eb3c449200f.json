@@ -1,0 +1,13 @@
+{
+  "worker_id": "9f616e85765b438aa2b91eb3c449200f",
+  "root": "/Users/wongdowling/Documents/autoresearch_harness/harness/claw-code",
+  "model": "qwen2.5-coder:7b",
+  "host": "http://localhost:11434",
+  "state": "ready",
+  "created_at": "2026-04-08T01:27:16Z",
+  "updated_at": "2026-04-08T01:27:16Z",
+  "run_count": 0,
+  "last_packet": null,
+  "last_result": null,
+  "last_error": null
+}

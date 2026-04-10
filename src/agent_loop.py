@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .llm_backend import DEFAULT_OLLAMA_HOST, DEFAULT_OLLAMA_MODEL, LLMBackendError, OllamaBackend
+from .llm_backend import DEFAULT_OLLAMA_HOST, DEFAULT_OLLAMA_MODEL, LLMBackend, LLMBackendError, OllamaBackend, create_backend
 from .permissions import ToolPermissionContext
 from .runtime_tools import RuntimeToolRegistry, render_tool_instructions
 
@@ -43,9 +43,11 @@ def run_agent_task(
     max_turns: int = 8,
     permission_context: ToolPermissionContext | None = None,
     trace: bool = False,
+    backend: LLMBackend | None = None,
 ) -> AgentRunResult:
     workspace_root = (root or Path.cwd()).resolve()
-    backend = OllamaBackend(model=model, host=host)
+    if backend is None:
+        backend = OllamaBackend(model=model, host=host)
     tools = RuntimeToolRegistry(root=workspace_root, permission_context=permission_context)
     messages = build_agent_messages(prompt=prompt, workspace_root=workspace_root, system_prompt=system_prompt)
     tool_calls: list[str] = []
@@ -55,6 +57,11 @@ def run_agent_task(
     edit_required = prompt_requires_edit(prompt)
     required_edit_target = infer_required_edit_target(prompt)
     fallback_used = False
+    # Tracks whether a successful file edit has been confirmed in the tool trace.
+    # Once True, the model is allowed to return a final answer without being
+    # asked to edit again — this enables early exit as soon as the edit lands
+    # rather than always running up to max_turns.
+    edit_confirmed = False
 
     for turn in range(1, max_turns + 1):
         response = backend.chat(messages, response_format='json', options={'temperature': 0})
@@ -95,7 +102,7 @@ def run_agent_task(
                     continue
                 messages.append({'role': 'user', 'content': tool_required_message()})
                 continue
-            if edit_required and not has_successful_edit(tool_trace, required_edit_target):
+            if edit_required and not edit_confirmed and not has_successful_edit(tool_trace, required_edit_target):
                 if trace:
                     trace_events.append(f'edit_required_reject[{turn}]={payload["content"]}')
                 fallback = None
@@ -119,6 +126,12 @@ def run_agent_task(
             )
 
         _append_tool_result(messages, tools, payload, tool_calls, tool_trace, trace_events if trace else None, turn)
+        # Check whether the edit was confirmed by this tool call so the model
+        # can exit on the very next turn rather than being forced to keep going.
+        if edit_required and not edit_confirmed:
+            edit_confirmed = has_successful_edit(tool_trace, required_edit_target)
+            if edit_confirmed and trace:
+                trace_events.append(f'edit_confirmed[{turn}]={required_edit_target!r}')
 
     if trace:
         trace_events.append(f'stopped=max_turns:{max_turns}')
@@ -220,13 +233,48 @@ def prompt_requires_tool(prompt: str) -> bool:
 
 
 def prompt_requires_edit(prompt: str) -> bool:
+    """Return True only when the prompt contains an un-negated mutating verb near a file target.
+
+    Negation prefixes like "do not edit", "don't modify", "never write" within a
+    10-character window before the verb are treated as read-only instructions so
+    that scope text such as "Do not edit any file" does not falsely set the flag.
+    """
     lowered = prompt.lower()
     edit_words = ('edit', 'modify', 'change', 'update', 'write', 'create', 'add')
+    negations = ('not ', "don't ", 'never ', 'no ')
     target_hints = ('.py', '.md', '.txt', 'file', 'workspace', 'train.py', 'src/')
-    return any(word in lowered for word in edit_words) and any(hint in lowered for hint in target_hints)
+
+    has_affirmative_edit = False
+    for word in edit_words:
+        pos = 0
+        while True:
+            idx = lowered.find(word, pos)
+            if idx == -1:
+                break
+            # Look at up to 12 characters before the verb for negation markers
+            prefix = lowered[max(0, idx - 12):idx]
+            if not any(neg in prefix for neg in negations):
+                has_affirmative_edit = True
+                break
+            pos = idx + 1
+        if has_affirmative_edit:
+            break
+
+    if not has_affirmative_edit:
+        return False
+    return any(hint in lowered for hint in target_hints)
 
 
 def infer_required_edit_target(prompt: str) -> str | None:
+    """Extract the file path that should be edited from the prompt.
+
+    Returns None when no concrete path-like token is found (e.g. the matched
+    word is a common English word like 'any', 'file', 'it', or 'this').
+    """
+    _GENERIC_WORDS = frozenset({
+        'any', 'file', 'files', 'it', 'this', 'that', 'them', 'here', 'there',
+        'code', 'module', 'script', 'document', 'content', 'text',
+    })
     match = re.search(
         r'(?:modify|edit|change|update|write|create|add(?:\s+to)?)\s+(?P<path>[\w./-]+)',
         prompt,
@@ -234,7 +282,11 @@ def infer_required_edit_target(prompt: str) -> str | None:
     )
     if not match:
         return None
-    return match.group('path')
+    path = match.group('path')
+    # Reject generic words that are not real file paths
+    if path.lower() in _GENERIC_WORDS or '.' not in path:
+        return None
+    return path
 
 
 def infer_tool_call_from_prompt(prompt: str, prefer_edit: bool = False) -> dict[str, Any] | None:
@@ -315,13 +367,44 @@ def infer_tool_call_from_prompt(prompt: str, prefer_edit: bool = False) -> dict[
 
 def infer_edit_tool_call_from_prompt(prompt: str) -> dict[str, Any] | None:
     modify_match = re.search(
-        r'(?:modify|edit|change|update)\s+(?P<path>[\w./-]+)\s+by\s+(?P<details>.+?)(?:\.|\n|$)',
+        r'(?:modify|edit|change|update)\s+(?P<path>[\w./-]+)\s+by\s+(?P<details>.+?)(?:(?<!\d)\.(?!\d)|\n|$)',
         prompt,
         flags=re.IGNORECASE,
     )
     if modify_match:
         path = modify_match.group('path')
         details = modify_match.group('details').strip().lower()
+        assignment_match = re.search(
+            r'(?:set|setting)\s+`?(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<value>[-+0-9.eE]+|True|False|None|".*?"|\'.*?\')`?',
+            modify_match.group('details').strip(),
+            flags=re.IGNORECASE,
+        )
+        if assignment_match:
+            variable_name = assignment_match.group('name')
+            replacement_value = assignment_match.group('value')
+            command = '\n'.join(
+                [
+                    "python3 - <<'PY'",
+                    'from pathlib import Path',
+                    'import json',
+                    'import re',
+                    f"target = Path({json.dumps(path)})",
+                    "text = target.read_text(encoding='utf-8')",
+                    f"name = {json.dumps(variable_name)}",
+                    f"value = {json.dumps(replacement_value)}",
+                    "pattern = re.compile(rf'^(?P<indent>\\s*){re.escape(name)}\\s*=.*$', flags=re.MULTILINE)",
+                    "replacement = f'{name} = {value}'",
+                    "updated, count = pattern.subn(replacement, text, count=1)",
+                    'if count != 1:',
+                    "    raise SystemExit(f'assignment not found: {name}')",
+                    "target.write_text(updated, encoding='utf-8')",
+                    'PY',
+                ]
+            )
+            return {
+                'name': 'run_shell_command',
+                'arguments': {'command': command, 'timeout_seconds': 20},
+            }
         if 'comment' in details:
             marker = '# smoke-test comment: '
             command = '\n'.join(

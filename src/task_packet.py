@@ -89,5 +89,26 @@ def render_worker_prompt(packet: TaskPacket) -> str:
     if packet.acceptance_tests:
         lines.append('Acceptance tests the manager will run after you finish:')
         lines.extend(f'- {command}' for command in packet.acceptance_tests)
-    lines.append('Make the required code or documentation changes in the workspace and return a concise final answer describing what changed and any blockers.')
+    if _is_readonly_packet(packet):
+        lines.append('Use tools to inspect the workspace and return a concise final answer.')
+    else:
+        lines.append('Make the required code or documentation changes in the workspace and return a concise final answer describing what changed and any blockers.')
     return '\n'.join(lines)
+
+
+def _is_readonly_packet(packet: TaskPacket) -> bool:
+    """Return True when the packet's scope explicitly prohibits file edits.
+
+    A task is considered read-only when its scope starts with (or is entirely
+    composed of) read-only language AND does not open with a mutation verb.
+    Tasks like the autoresearch packet that say "Modify only train.py … Do not
+    edit prepare.py" are edit tasks — the leading verb wins.
+    """
+    scope = packet.scope.lower().strip()
+    # If the scope opens with a mutation verb the task is definitely an edit task.
+    _EDIT_OPENERS = ('modify ', 'edit ', 'change ', 'update ', 'write ', 'create ', 'add ')
+    if any(scope.startswith(v) for v in _EDIT_OPENERS):
+        return False
+    # Otherwise look for readonly signals at the start of the scope.
+    _READONLY_SIGNALS = ('do not edit', 'not edit', 'no edit', 'read only', 'read-only', 'read ')
+    return any(scope.startswith(sig) or (f' {sig}' in scope[:60]) for sig in _READONLY_SIGNALS)

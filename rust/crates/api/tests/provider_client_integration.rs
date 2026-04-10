@@ -46,6 +46,20 @@ fn provider_client_uses_explicit_anthropic_auth_without_env_lookup() {
 }
 
 #[test]
+fn provider_client_prefers_openai_when_base_url_explicitly_targets_openai_compat() {
+    let _lock = env_lock();
+    let _anthropic_api_key = EnvVarGuard::set("ANTHROPIC_API_KEY", Some("anthropic-test-key"));
+    let _anthropic_auth_token = EnvVarGuard::set("ANTHROPIC_AUTH_TOKEN", None);
+    let _openai_base_url = EnvVarGuard::set("OPENAI_BASE_URL", Some("http://127.0.0.1:11434/v1"));
+    let _openai_api_key = EnvVarGuard::set("OPENAI_API_KEY", Some("local"));
+
+    let client =
+        ProviderClient::from_model("qwen2.5-coder:7b").expect("openai-compat routing should win");
+
+    assert_eq!(client.provider_kind(), ProviderKind::OpenAi);
+}
+
+#[test]
 fn read_xai_base_url_prefers_env_override() {
     let _lock = env_lock();
     let _xai_base_url = EnvVarGuard::set("XAI_BASE_URL", Some("https://example.xai.test/v1"));

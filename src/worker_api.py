@@ -9,12 +9,14 @@ from typing import Any
 from uuid import uuid4
 
 from .agent_loop import AgentRunResult, run_agent_task
-from .llm_backend import DEFAULT_OLLAMA_HOST, DEFAULT_OLLAMA_MODEL
+from .llm_backend import DEFAULT_OLLAMA_HOST, DEFAULT_OLLAMA_MODEL, LLMBackend
 from .task_packet import TaskPacket, load_task_packet, render_worker_prompt
 
 DEFAULT_WORKER_DIR = Path('.port_workers')
 DEFAULT_ACCEPTANCE_TIMEOUT_SECONDS = 300
 INTERNAL_CHANGED_FILE_PREFIXES = ('.port_sessions/', '.port_workers/')
+INTERNAL_CHANGED_FILE_MARKERS = ('__pycache__/',)
+INTERNAL_CHANGED_FILE_SUFFIXES = ('.pyc',)
 
 
 @dataclass
@@ -103,6 +105,7 @@ def run_worker(
     packet_source: TaskPacket | str | Path,
     directory: Path | None = None,
     trace: bool = False,
+    backend: LLMBackend | None = None,
 ) -> WorkerRecord:
     worker = load_worker(worker_id, directory=directory)
     if worker.state == 'closed':
@@ -125,6 +128,7 @@ def run_worker(
             host=running_worker.host,
             root=Path(running_worker.root),
             trace=trace,
+            backend=backend,
         )
         verification_steps = _run_acceptance_tests(Path(running_worker.root), packet.acceptance_tests)
         changed_files = _collect_changed_files(Path(running_worker.root), before_paths, agent_result)
@@ -262,7 +266,11 @@ def _collect_changed_files(root: Path, before_paths: set[str], agent_result: Age
     }
     changed = (after_paths - before_paths) | edited_paths
     return sorted(
-        path for path in changed if not any(path.startswith(prefix) for prefix in INTERNAL_CHANGED_FILE_PREFIXES)
+        path
+        for path in changed
+        if not any(path.startswith(prefix) for prefix in INTERNAL_CHANGED_FILE_PREFIXES)
+        and not any(marker in path for marker in INTERNAL_CHANGED_FILE_MARKERS)
+        and not path.endswith(INTERNAL_CHANGED_FILE_SUFFIXES)
     )
 
 

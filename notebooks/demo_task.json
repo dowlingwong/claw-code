@@ -1,12 +1,12 @@
 {
-  "objective": "Inspect the Python CLI and report the worker-related commands.",
-  "scope": "Inspect src/main.py and worker modules only when needed.",
+  "objective": "Read src/main.py lines 1 to 40 and return the list of top-level subcommands registered by build_parser().",
+  "scope": "Read src/main.py only. Do not edit any file. Do not run tests.",
   "repo": "claw-code",
   "branch_policy": "Do not create or switch branches.",
   "acceptance_tests": [
-    "python3 -m unittest tests/test_porting_workspace.py"
+    "python3 -c \"import src.main; print('import ok')\""
   ],
   "commit_policy": "Do not commit.",
-  "reporting_contract": "Report worker commands, changed files, verification results, and blockers.",
+  "reporting_contract": "Return the subcommand names as a JSON array under the key 'subcommands'.",
   "escalation_policy": "Stop if Ollama is unavailable or a required tool fails repeatedly."
 }

@@ -11,7 +11,7 @@ from typing import Any
 RESULTS_HEADER = 'commit\tval_bpb\tmemory_gb\tstatus\tdescription\n'
 DEFAULT_RUN_LOG = 'run.log'
 DEFAULT_RESULTS_TSV = 'results.tsv'
-DEFAULT_EXPERIMENT_TIMEOUT_SECONDS = 600
+DEFAULT_EXPERIMENT_TIMEOUT_SECONDS = 360
 TRAIN_COMMAND = 'uv run train.py > run.log 2>&1'
 
 
@@ -273,7 +273,11 @@ def _extract_metrics(text: str) -> dict[str, float]:
     )
     metrics: dict[str, float] = {}
     for key in keys:
-        match = re.search(rf'^{re.escape(key)}:\s+([0-9.]+)$', text, flags=re.MULTILINE)
+        match = re.search(
+            rf'^\s*{re.escape(key)}\s*[:=]\s*([-+]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][-+]?\d+)?)\s*$',
+            text,
+            flags=re.MULTILINE,
+        )
         if match:
             metrics[key] = float(match.group(1))
     return metrics

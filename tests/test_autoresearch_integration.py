@@ -17,6 +17,7 @@ from src.autoresearch_runner import (
     short_head_commit,
     setup_autoresearch,
 )
+from src.agent_loop import infer_edit_tool_call_from_prompt
 from src.autoresearch_worker import (
     AutoresearchExperimentPacket,
     autoresearch_status,
@@ -24,11 +25,14 @@ from src.autoresearch_worker import (
     ensure_autoresearch_baseline,
     ensure_autoresearch_branch,
     keep_autoresearch_candidate,
+    load_memory_events,
     load_autoresearch_packet,
     load_autoresearch_state,
     loop_autoresearch,
     run_autoresearch_packet,
+    summarize_memory_events,
 )
+from src.demo_verification import build_diff_summary, extract_metric_from_text, get_changed_files, snapshot_workspace_sources
 from src.worker_api import WorkerRecord
 
 
@@ -76,6 +80,16 @@ class AutoresearchIntegrationTests(unittest.TestCase):
             self.assertTrue(metrics.success)
             self.assertEqual(metrics.val_bpb, 0.9979)
             self.assertEqual(metrics.depth, 8)
+
+    def test_extract_metric_from_text_accepts_equals_and_scientific_notation(self) -> None:
+        text = '\n'.join(
+            [
+                'candidate metric follows',
+                'val_bpb = 9.979e-01',
+                'depth: 8',
+            ]
+        )
+        self.assertEqual(extract_metric_from_text(text), 0.9979)
 
     def test_append_results_row_and_best_bpb(self) -> None:
         with TemporaryDirectory() as tmpdir:
@@ -161,6 +175,134 @@ class AutoresearchIntegrationTests(unittest.TestCase):
             self.assertTrue((root / 'results.tsv').exists())
             self.assertIsNotNone(result['state']['pending_experiment'])
             self.assertEqual((root / 'results.tsv').read_text(encoding='utf-8').count('\n'), 1)
+            memory = load_memory_events(root)
+            self.assertTrue(memory)
+            candidate = memory[-1]['payload']
+            self.assertEqual(candidate['experiment_id'], result['commit'])
+            self.assertEqual(candidate['code_change_summary'], ['train.py'])
+            self.assertEqual(candidate['decision_rationale'], '')
+            self.assertEqual(candidate['failure_tag'], '')
+            self.assertEqual(candidate['idea_key'], 'tweak-train-py')
+            summary = summarize_memory_events(root, limit=5)
+            self.assertEqual(summary['memory_event_count'], len(memory))
+            self.assertEqual(summary['idea_rollup'][0]['idea_key'], 'tweak-train-py')
+            self.assertEqual(summary['recent_events'][-1]['event'], 'candidate_run')
+
+    def test_run_autoresearch_packet_applies_deterministic_assignment_fallback_after_no_change(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            for name in ('prepare.py', 'program.md'):
+                (root / name).write_text('# stub\n', encoding='utf-8')
+            (root / 'train.py').write_text('LEARNING_RATE = 1e-3\nprint("hello")\n', encoding='utf-8')
+            self.init_repo(root)
+
+            packet = AutoresearchExperimentPacket(
+                objective='Modify train.py by setting LEARNING_RATE = 0.0005 to test a smaller step size.',
+                description='Set LEARNING_RATE = 0.0005',
+            )
+            worker = WorkerRecord(
+                worker_id='worker123',
+                root=str(root),
+                model='qwen2.5-coder:7b',
+                host='http://localhost:11434',
+                state='failed',
+                created_at='2026-04-07T00:00:00Z',
+                updated_at='2026-04-07T00:00:01Z',
+                run_count=1,
+                last_packet={},
+                last_result={
+                    'changed_files': [],
+                    'tool_calls': [],
+                    'tool_trace': [],
+                    'verification': {'acceptance_tests': []},
+                    'final_answer': '',
+                    'stop_reason': 'error',
+                },
+                last_error='Agent stopped after reaching max_turns=8.',
+            )
+
+            with patch('src.autoresearch_worker.create_worker', return_value=worker):
+                with patch('src.autoresearch_worker.run_worker', return_value=worker):
+                    with patch(
+                        'src.autoresearch_worker.run_experiment',
+                        return_value=ExperimentMetrics(
+                            success=True,
+                            log_path=str(root / 'run.log'),
+                            timed_out=False,
+                            return_code=0,
+                            val_bpb=0.97,
+                            peak_vram_mb=1024.0,
+                        ),
+                    ):
+                        result = run_autoresearch_packet(packet, root=root, trace=False)
+
+            self.assertEqual(result['recommended_status'], 'keep')
+            self.assertIn('LEARNING_RATE = 0.0005', (root / 'train.py').read_text(encoding='utf-8'))
+            self.assertEqual(result['worker']['last_result']['changed_files'], ['train.py'])
+            self.assertEqual(result['worker']['state'], 'finished')
+
+    def test_run_autoresearch_packet_repairs_invalid_assignment_syntax(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            for name in ('prepare.py', 'program.md'):
+                (root / name).write_text('# stub\n', encoding='utf-8')
+            (root / 'train.py').write_text('DROPOUT = 0.0\nprint("hello")\n', encoding='utf-8')
+            self.init_repo(root)
+            (root / 'train.py').write_text('DROPOUT = 0.100000.\nprint("hello")\n', encoding='utf-8')
+
+            packet = AutoresearchExperimentPacket(
+                objective='Modify train.py by setting DROPOUT = 0.100000 for stronger regularization.',
+                description='Set DROPOUT = 0.100000',
+            )
+            worker = WorkerRecord(
+                worker_id='worker123',
+                root=str(root),
+                model='qwen2.5-coder:7b',
+                host='http://localhost:11434',
+                state='failed',
+                created_at='2026-04-07T00:00:00Z',
+                updated_at='2026-04-07T00:00:01Z',
+                run_count=1,
+                last_packet={},
+                last_result={
+                    'changed_files': ['train.py'],
+                    'tool_calls': ['edit_file'],
+                    'tool_trace': [],
+                    'verification': {
+                        'acceptance_tests': [
+                            {
+                                'command': 'python3 -m py_compile train.py',
+                                'success': False,
+                                'exit_code': 1,
+                                'output': 'SyntaxError',
+                            }
+                        ]
+                    },
+                    'final_answer': '',
+                    'stop_reason': 'verification_failed',
+                },
+                last_error='SyntaxError',
+            )
+
+            with patch('src.autoresearch_worker.create_worker', return_value=worker):
+                with patch('src.autoresearch_worker.run_worker', return_value=worker):
+                    with patch(
+                        'src.autoresearch_worker.run_experiment',
+                        return_value=ExperimentMetrics(
+                            success=True,
+                            log_path=str(root / 'run.log'),
+                            timed_out=False,
+                            return_code=0,
+                            val_bpb=0.96,
+                            peak_vram_mb=1024.0,
+                        ),
+                    ):
+                        result = run_autoresearch_packet(packet, root=root, trace=False)
+
+            self.assertEqual(result['recommended_status'], 'keep')
+            self.assertIn('DROPOUT = 0.100000', (root / 'train.py').read_text(encoding='utf-8'))
+            self.assertNotIn('0.100000.', (root / 'train.py').read_text(encoding='utf-8'))
+            self.assertEqual(result['worker']['state'], 'finished')
 
     def test_keep_autoresearch_candidate_records_keep(self) -> None:
         with TemporaryDirectory() as tmpdir:
@@ -205,7 +347,7 @@ class AutoresearchIntegrationTests(unittest.TestCase):
                     ):
                         run_autoresearch_packet(packet, root=root, trace=False)
 
-            result = keep_autoresearch_candidate(root)
+            result = keep_autoresearch_candidate(root, rationale='val_bpb improved 0.03 vs baseline')
             state = load_autoresearch_state(root)
             rows = (root / 'results.tsv').read_text(encoding='utf-8').splitlines()
             self.assertEqual(result['decision'], 'keep')
@@ -214,6 +356,15 @@ class AutoresearchIntegrationTests(unittest.TestCase):
             self.assertEqual(state.best_bpb, 0.98)
             self.assertEqual(len(rows), 2)
             self.assertIn('\tkeep\tKeep candidate', rows[1])
+            memory = load_memory_events(root)
+            latest = memory[-1]['payload']
+            self.assertEqual(latest['decision_rationale'], 'val_bpb improved 0.03 vs baseline')
+            self.assertEqual(latest['code_change_summary'], ['train.py'])
+            self.assertEqual(latest['failure_tag'], '')
+            self.assertEqual(latest['idea_key'], 'keep-candidate')
+            summary = summarize_memory_events(root, limit=5)
+            self.assertEqual(summary['latest_decision']['event'], 'keep')
+            self.assertEqual(summary['idea_rollup'][0]['keeps'], 1)
 
     def test_discard_autoresearch_candidate_resets_repo(self) -> None:
         with TemporaryDirectory() as tmpdir:
@@ -275,11 +426,19 @@ class AutoresearchIntegrationTests(unittest.TestCase):
                     ):
                         run_autoresearch_packet(packet, root=root, trace=False)
 
-            discard = discard_autoresearch_candidate(root)
+            discard = discard_autoresearch_candidate(root, rationale='no improvement over current best')
             self.assertEqual(discard['decision'], 'discard')
             self.assertEqual(short_head_commit(root), discard['reverted_to_commit'])
             self.assertIn('candidate', (root / 'train.py').read_text(encoding='utf-8'))
             self.assertNotEqual(short_head_commit(root), 'unknown')
+            memory = load_memory_events(root)
+            latest = memory[-1]['payload']
+            self.assertEqual(latest['decision_rationale'], 'no improvement over current best')
+            self.assertEqual(latest['code_change_summary'], ['train.py'])
+            self.assertEqual(latest['failure_tag'], 'no_improvement')
+            summary = summarize_memory_events(root, limit=5)
+            self.assertEqual(summary['latest_decision']['event'], 'discard')
+            self.assertTrue(summary['idea_rollup'])
 
     def test_ensure_autoresearch_baseline_records_first_run(self) -> None:
         with TemporaryDirectory() as tmpdir:
@@ -372,6 +531,86 @@ class AutoresearchIntegrationTests(unittest.TestCase):
 
             self.assertEqual(len(result['history']), 1)
             self.assertEqual(result['history'][0]['decision']['decision'], 'keep')
+
+    def test_memory_reader_and_pending_run_guard_inputs_are_available(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            for name in ('prepare.py', 'program.md'):
+                (root / name).write_text('# stub\n', encoding='utf-8')
+            (root / 'train.py').write_text('print("hello")\n', encoding='utf-8')
+            self.init_repo(root)
+
+            packet = AutoresearchExperimentPacket(
+                objective='Try a small change',
+                description='Tweak train.py',
+            )
+            worker = WorkerRecord(
+                worker_id='worker123',
+                root=str(root),
+                model='qwen2.5-coder:7b',
+                host='http://localhost:11434',
+                state='finished',
+                created_at='2026-04-07T00:00:00Z',
+                updated_at='2026-04-07T00:00:01Z',
+                run_count=1,
+                last_packet={},
+                last_result={
+                    'changed_files': ['train.py'],
+                    'tool_calls': ['edit_file'],
+                    'tool_trace': [],
+                    'verification': {'acceptance_tests': []},
+                },
+            )
+            (root / 'train.py').write_text('print("changed")\n', encoding='utf-8')
+            with patch('src.autoresearch_worker.create_worker', return_value=worker):
+                with patch('src.autoresearch_worker.run_worker', return_value=worker):
+                    with patch(
+                        'src.autoresearch_worker.run_experiment',
+                        return_value=ExperimentMetrics(
+                            success=True,
+                            log_path=str(root / 'run.log'),
+                            timed_out=False,
+                            return_code=0,
+                            val_bpb=0.98,
+                            peak_vram_mb=2048.0,
+                        ),
+                    ):
+                        run_result = run_autoresearch_packet(packet, root=root, trace=False)
+
+            memory = load_memory_events(root, limit=1)
+            self.assertEqual(len(memory), 1)
+            self.assertEqual(memory[0]['payload']['experiment_id'], run_result['commit'])
+
+            state = load_autoresearch_state(root)
+            self.assertIsNotNone(state.pending_experiment)
+
+    def test_demo_verification_snapshot_and_diff_summary(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / 'train.py').write_text('DEMO_OFFSET = 0.0\nprint("hi")\n', encoding='utf-8')
+            (root / 'prepare.py').write_text('# stub\n', encoding='utf-8')
+            (root / 'program.md').write_text('demo\n', encoding='utf-8')
+
+            before = snapshot_workspace_sources(root)
+            (root / 'train.py').write_text('DEMO_OFFSET = -0.03\nprint("hi")\n', encoding='utf-8')
+            after = snapshot_workspace_sources(root)
+
+            self.assertEqual(get_changed_files(before, after), ['train.py'])
+            summary = build_diff_summary(before, after)
+            self.assertEqual(summary[0]['path'], 'train.py')
+            self.assertGreater(summary[0]['changed_line_count'], 0)
+            self.assertIn('-DEMO_OFFSET = 0.0', summary[0]['diff'])
+            self.assertIn('+DEMO_OFFSET = -0.03', summary[0]['diff'])
+
+    def test_infer_edit_tool_call_from_prompt_supports_assignment_replacement(self) -> None:
+        tool_call = infer_edit_tool_call_from_prompt(
+            'Modify train.py by setting DEMO_OFFSET = -0.030 so the deterministic validation metric improves.'
+        )
+        self.assertIsNotNone(tool_call)
+        assert tool_call is not None
+        self.assertEqual(tool_call['name'], 'run_shell_command')
+        self.assertIn('DEMO_OFFSET', tool_call['arguments']['command'])
+        self.assertIn('-0.030', tool_call['arguments']['command'])
 
     def test_autoresearch_cli_setup_and_parse_log(self) -> None:
         from src.main import main

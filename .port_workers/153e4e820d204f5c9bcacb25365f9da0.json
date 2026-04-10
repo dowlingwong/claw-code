@@ -1,0 +1,24 @@
+{
+  "worker_id": "153e4e820d204f5c9bcacb25365f9da0",
+  "root": "/Users/wongdowling/Documents/autoresearch_harness/nodes/autoresearch-macos",
+  "model": "qwen2.5-coder:7b",
+  "host": "http://localhost:11434",
+  "state": "running",
+  "created_at": "2026-04-08T00:50:10Z",
+  "updated_at": "2026-04-08T00:50:10Z",
+  "run_count": 0,
+  "last_packet": {
+    "objective": "Modify train.py by incrementing or inserting a harmless smoke-test comment counter near the top of the file. You must change train.py on every run. A no-op is failure.",
+    "scope": "Modify only train.py in the autoresearch repo. You may read program.md, README.md, and train.py for context, but train.py is the only file you may change. Editing any other path is failure. Do not edit prepare.py, pyproject.toml, or dependencies. Do not run the full training experiment yourself; the manager will run it after your code change. Use syntax and git inspection tools when helpful.",
+    "repo": "/Users/wongdowling/Documents/autoresearch_harness/nodes/autoresearch-macos",
+    "branch_policy": "Stay on the current branch. Do not create or switch branches.",
+    "acceptance_tests": [
+      "python3 -m py_compile train.py"
+    ],
+    "commit_policy": "Do not commit. The manager records and evaluates the experiment after your edit.",
+    "reporting_contract": "Return a concise summary of the train.py change, intended effect on val_bpb, and any blockers.",
+    "escalation_policy": "Stop if a required file outside train.py would need modification or if syntax cannot be preserved."
+  },
+  "last_result": null,
+  "last_error": null
+}

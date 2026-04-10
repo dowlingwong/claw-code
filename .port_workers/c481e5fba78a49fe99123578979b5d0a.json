@@ -1,0 +1,41 @@
+{
+  "worker_id": "c481e5fba78a49fe99123578979b5d0a",
+  "root": "/Users/wongdowling/Documents/autoresearch_harness/harness/claw-code",
+  "model": "qwen2.5-coder:7b",
+  "host": "http://localhost:11434",
+  "state": "failed",
+  "created_at": "2026-04-08T01:32:53Z",
+  "updated_at": "2026-04-08T01:34:44Z",
+  "run_count": 1,
+  "last_packet": {
+    "objective": "Read src/main.py lines 1 to 40 and return the list of top-level subcommands registered by build_parser().",
+    "scope": "Read src/main.py only. Do not edit any file. Do not run tests.",
+    "repo": "claw-code",
+    "branch_policy": "Do not create or switch branches.",
+    "acceptance_tests": [
+      "python3 -c \"import src.main; print('import ok')\""
+    ],
+    "commit_policy": "Do not commit.",
+    "reporting_contract": "Return the subcommand names as a JSON array under the key 'subcommands'.",
+    "escalation_policy": "Stop if Ollama is unavailable or a required tool fails repeatedly."
+  },
+  "last_result": {
+    "worker_id": "c481e5fba78a49fe99123578979b5d0a",
+    "state": "failed",
+    "tool_calls": [],
+    "tool_trace": [],
+    "artifacts": [],
+    "changed_files": [],
+    "verification": {
+      "acceptance_tests": [],
+      "tool_runs": {
+        "run_tests": [],
+        "run_build": []
+      }
+    },
+    "final_answer": "",
+    "stop_reason": "error",
+    "error": "Agent stopped after reaching max_turns=8."
+  },
+  "last_error": "Agent stopped after reaching max_turns=8."
+}

@@ -5,6 +5,7 @@ import json
 import sys
 from pathlib import Path
 
+from .api_server import DEFAULT_API_HOST, DEFAULT_API_PORT, run_api_server
 from .autoresearch_runner import parse_run_log, setup_autoresearch
 from .autoresearch_worker import (
     autoresearch_status,
@@ -19,7 +20,7 @@ from .bootstrap_graph import build_bootstrap_graph
 from .command_graph import build_command_graph
 from .commands import execute_command, get_command, get_commands, render_command_index
 from .agent_loop import DEFAULT_AGENT_SYSTEM_PROMPT, run_agent_task
-from .llm_backend import DEFAULT_OLLAMA_HOST, DEFAULT_OLLAMA_MODEL, LLMBackendError
+from .llm_backend import DEFAULT_OLLAMA_HOST, DEFAULT_OLLAMA_MODEL, LLMBackendError, create_backend
 from .direct_modes import run_deep_link, run_direct_connect
 from .parity_audit import run_parity_audit
 from .permissions import ToolPermissionContext
@@ -112,10 +113,15 @@ def build_parser() -> argparse.ArgumentParser:
     chat_parser.add_argument('--host', default=DEFAULT_OLLAMA_HOST)
     chat_parser.add_argument('--system')
 
-    agent_parser = subparsers.add_parser('agent', help='run the local Ollama agent loop with executable workspace tools')
+    agent_parser = subparsers.add_parser('agent', help='run the local agent loop with executable workspace tools')
     agent_parser.add_argument('prompt', nargs='?')
     agent_parser.add_argument('--model', default=DEFAULT_OLLAMA_MODEL)
     agent_parser.add_argument('--host', default=DEFAULT_OLLAMA_HOST)
+    agent_parser.add_argument('--backend', default='ollama', choices=['ollama', 'openai-compat'],
+                              help='LLM backend: "ollama" (native Ollama API) or "openai-compat" '
+                                   '(any OpenAI-compatible server: llama.cpp, LM Studio, vLLM, etc.)')
+    agent_parser.add_argument('--api-key', default=None,
+                              help='API key for openai-compat backend (defaults to OPENAI_API_KEY env var or "local")')
     agent_parser.add_argument('--system')
     agent_parser.add_argument('--max-turns', type=int, default=8)
     agent_parser.add_argument('--deny-tool', action='append', default=[])
@@ -159,6 +165,9 @@ def build_parser() -> argparse.ArgumentParser:
     autoresearch_run.add_argument('--packet', required=True)
     autoresearch_run.add_argument('--model', default=DEFAULT_OLLAMA_MODEL)
     autoresearch_run.add_argument('--host', default=DEFAULT_OLLAMA_HOST)
+    autoresearch_run.add_argument('--backend', default='ollama', choices=['ollama', 'openai-compat'],
+                                  help='LLM backend for the code-editing worker')
+    autoresearch_run.add_argument('--api-key', default=None)
     autoresearch_run.add_argument('--trace', action='store_true')
 
     autoresearch_status_parser = autoresearch_subparsers.add_parser('status', help='show current autoresearch control-plane state')
@@ -169,7 +178,7 @@ def build_parser() -> argparse.ArgumentParser:
     autoresearch_baseline.add_argument('--command', dest='train_command', default='uv run train.py > run.log 2>&1')
     autoresearch_baseline.add_argument('--log-path', default='run.log')
     autoresearch_baseline.add_argument('--results-tsv', default='results.tsv')
-    autoresearch_baseline.add_argument('--timeout-seconds', type=int, default=600)
+    autoresearch_baseline.add_argument('--timeout-seconds', type=int, default=360)
 
     autoresearch_keep = autoresearch_subparsers.add_parser('keep', help='finalize the pending autoresearch candidate as keep')
     autoresearch_keep.add_argument('--root')
@@ -188,10 +197,26 @@ def build_parser() -> argparse.ArgumentParser:
     autoresearch_loop.add_argument('--packet', required=True)
     autoresearch_loop.add_argument('--model', default=DEFAULT_OLLAMA_MODEL)
     autoresearch_loop.add_argument('--host', default=DEFAULT_OLLAMA_HOST)
+    autoresearch_loop.add_argument('--backend', default='ollama', choices=['ollama', 'openai-compat'],
+                                   help='LLM backend for the code-editing worker')
+    autoresearch_loop.add_argument('--api-key', default=None)
     autoresearch_loop.add_argument('--iterations', type=int, default=1)
     autoresearch_loop.add_argument('--retry-limit', type=int, default=1)
     autoresearch_loop.add_argument('--allow-any-branch', action='store_true')
     autoresearch_loop.add_argument('--trace', action='store_true')
+
+    api_server_parser = subparsers.add_parser(
+        'api-server',
+        help='start a local REST API server so any LLM with HTTP tool-use can drive autoresearch',
+    )
+    api_server_parser.add_argument('--root', help='path to the autoresearch node repo')
+    api_server_parser.add_argument('--port', type=int, default=DEFAULT_API_PORT)
+    api_server_parser.add_argument('--listen', default=DEFAULT_API_HOST, metavar='HOST',
+                                   help='address to bind (default 127.0.0.1; use 0.0.0.0 to expose on LAN)')
+    api_server_parser.add_argument('--model', default=DEFAULT_OLLAMA_MODEL)
+    api_server_parser.add_argument('--host', default=DEFAULT_OLLAMA_HOST)
+    api_server_parser.add_argument('--backend', default='ollama', choices=['ollama', 'openai-compat'])
+    api_server_parser.add_argument('--api-key', default=None)
 
     autoresearch_parse_log = autoresearch_subparsers.add_parser('parse-log', help='parse a train.py run log into machine-readable metrics')
     autoresearch_parse_log.add_argument('--root')
@@ -342,15 +367,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == 'agent':
         prompt = resolve_chat_prompt(args, parser)
         permission_context = ToolPermissionContext.from_iterables(args.deny_tool, args.deny_prefix)
+        backend = create_backend(
+            backend_kind=args.backend,
+            model=args.model,
+            host=args.host,
+            api_key=getattr(args, 'api_key', None),
+        )
         try:
             result = run_agent_task(
                 prompt,
-                model=args.model,
-                host=args.host,
                 system_prompt=args.system if args.system is not None else DEFAULT_AGENT_SYSTEM_PROMPT,
                 max_turns=args.max_turns,
                 permission_context=permission_context,
                 trace=args.trace,
+                backend=backend,
             )
             if args.trace:
                 for event in result.trace_events:
@@ -405,6 +435,12 @@ def main(argv: list[str] | None = None) -> int:
                     model=args.model,
                     host=args.host,
                     trace=args.trace,
+                    backend=create_backend(
+                        backend_kind=args.backend,
+                        model=args.model,
+                        host=args.host,
+                        api_key=getattr(args, 'api_key', None),
+                    ),
                 )
                 print(json.dumps(result, indent=2))
                 return 0
@@ -446,6 +482,12 @@ def main(argv: list[str] | None = None) -> int:
                     retry_limit=args.retry_limit,
                     require_isolated_branch=not args.allow_any_branch,
                     trace=args.trace,
+                    backend=create_backend(
+                        backend_kind=args.backend,
+                        model=args.model,
+                        host=args.host,
+                        api_key=getattr(args, 'api_key', None),
+                    ),
                 )
                 print(json.dumps(result, indent=2))
                 return 0
@@ -459,6 +501,22 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as error:
             print(error, file=sys.stderr)
             return 1
+    if args.command == 'api-server':
+        from .autoresearch_runner import resolve_autoresearch_root
+        try:
+            root = resolve_autoresearch_root(args.root)
+            backend = create_backend(
+                backend_kind=args.backend,
+                model=args.model,
+                host=args.host,
+                api_key=getattr(args, 'api_key', None),
+            )
+            run_api_server(root=root, backend=backend, host=args.listen, port=args.port)
+        except Exception as error:
+            print(error, file=sys.stderr)
+            return 1
+        return 0
+
     parser.error(f'unknown command: {args.command}')
     return 2
 

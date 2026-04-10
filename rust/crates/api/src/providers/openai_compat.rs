@@ -933,6 +933,14 @@ pub fn has_api_key(key: &str) -> bool {
 }
 
 #[must_use]
+pub fn has_base_url_override(key: &str) -> bool {
+    read_env_non_empty(key)
+        .ok()
+        .and_then(std::convert::identity)
+        .is_some()
+}
+
+#[must_use]
 pub fn read_base_url(config: OpenAiCompatConfig) -> String {
     std::env::var(config.base_url_env).unwrap_or_else(|_| config.default_base_url.to_string())
 }

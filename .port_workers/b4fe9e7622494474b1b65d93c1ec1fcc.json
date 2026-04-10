@@ -1,0 +1,101 @@
+{
+  "worker_id": "b4fe9e7622494474b1b65d93c1ec1fcc",
+  "root": "/private/var/folders/mf/cqjfz_8x7tgbhvl955fzybtr0000gn/T/resnet-trigger-3x5-rgwe7mpl/ResNet_trigger",
+  "model": "qwen2.5-coder:7b",
+  "host": "http://localhost:11434",
+  "state": "finished",
+  "created_at": "2026-04-09T22:31:03Z",
+  "updated_at": "2026-04-09T22:31:30Z",
+  "run_count": 1,
+  "last_packet": {
+    "objective": "Modify train.py by setting KERNEL_SIZE = 5 to test a narrower temporal receptive field while keeping all other knobs fixed.\n\nExperiment description: R2W1: Set KERNEL_SIZE = 5",
+    "scope": "Modify only train.py in the autoresearch repo. You may read program.md, README.md, and train.py for context, but train.py is the only file you may change. Editing any other path is failure. Do not edit prepare.py, pyproject.toml, or dependencies. Do not run the full training experiment yourself; the manager will run it after your code change. For simple parameter changes, prefer an exact single-line replacement of the existing assignment in train.py. Preserve valid Python syntax and do not append extra punctuation after numeric literals. Use syntax and git inspection tools when helpful.",
+    "repo": "/private/var/folders/mf/cqjfz_8x7tgbhvl955fzybtr0000gn/T/resnet-trigger-3x5-rgwe7mpl/ResNet_trigger",
+    "branch_policy": "Stay on the current branch. Do not create or switch branches.",
+    "acceptance_tests": [
+      "python3 -m py_compile train.py"
+    ],
+    "commit_policy": "Do not commit. The manager records and evaluates the experiment after your edit.",
+    "reporting_contract": "Return a concise summary of the exact train.py line you changed, the intended effect on val_bpb, and any blockers.",
+    "escalation_policy": "Stop if a required file outside train.py would need modification or if syntax cannot be preserved."
+  },
+  "last_result": {
+    "worker_id": "b4fe9e7622494474b1b65d93c1ec1fcc",
+    "state": "finished",
+    "packet": {
+      "objective": "Modify train.py by setting KERNEL_SIZE = 5 to test a narrower temporal receptive field while keeping all other knobs fixed.\n\nExperiment description: R2W1: Set KERNEL_SIZE = 5",
+      "scope": "Modify only train.py in the autoresearch repo. You may read program.md, README.md, and train.py for context, but train.py is the only file you may change. Editing any other path is failure. Do not edit prepare.py, pyproject.toml, or dependencies. Do not run the full training experiment yourself; the manager will run it after your code change. For simple parameter changes, prefer an exact single-line replacement of the existing assignment in train.py. Preserve valid Python syntax and do not append extra punctuation after numeric literals. Use syntax and git inspection tools when helpful.",
+      "repo": "/private/var/folders/mf/cqjfz_8x7tgbhvl955fzybtr0000gn/T/resnet-trigger-3x5-rgwe7mpl/ResNet_trigger",
+      "branch_policy": "Stay on the current branch. Do not create or switch branches.",
+      "acceptance_tests": [
+        "python3 -m py_compile train.py"
+      ],
+      "commit_policy": "Do not commit. The manager records and evaluates the experiment after your edit.",
+      "reporting_contract": "Return a concise summary of the exact train.py line you changed, the intended effect on val_bpb, and any blockers.",
+      "escalation_policy": "Stop if a required file outside train.py would need modification or if syntax cannot be preserved."
+    },
+    "tool_calls": [
+      "read_file",
+      "run_shell_command"
+    ],
+    "tool_trace": [
+      {
+        "turn": 1,
+        "name": "read_file",
+        "arguments": {
+          "path": "train.py"
+        },
+        "success": true,
+        "output": "1\t\"\"\"\n2\tSingle-file training entrypoint for the ResNet trigger autoresearch node.\n3\t\n4\tThis is the only file the worker should modify in the experiment loop.\n5\tThe output format intentionally mirrors autoresearch-macos so the existing\n6\tcontrol plane can parse it:\n7\t\n8\t---\n9\tval_bpb:          <lower is better compatibility objective>\n10\ttraining_seconds: ...\n11\ttotal_seconds:    ...\n12\tpeak_vram_mb:     ...\n13\t...\n14\t\n15\tFor this classification task:\n16\t    val_bpb = 1 - best_val_auc\n17\t\"\"\"\n18\t\n19\tfrom __future__ import annotations\n20\t\n21\timport json\n22\timport os\n23\timport time\n24\tfrom dataclasses import dataclass\n25\tfrom pathlib import Path\n26\timport types\n27\t\n28\timport numpy as np\n29\timport torch\n30\timport torch.nn as nn\n31\tfrom sklearn.metrics import average_precision_score, confusion_matrix, roc_auc_score\n32\tfrom torch.utils.data import DataLoader, TensorDataset\n33\t\n34\tfrom prepare import (\n35\t    ARTIFACT_DIR,\n36\t    DataConfig,\n37\t    objective_from_val_auc,\n38\t    peak_vram_mb,\n39\t    prepare_run_arrays,\n40\t    resolve_device,\n41\t    save_json_artifact,\n42\t)\n43\t\n44\t\n45\tos.environ.setdefault(\"PYTORCH_ENABLE_MPS_FALLBACK\", \"1\")\n46\t\n47\t\n48\tdef _env_flag(name: str, default: bool) -> bool:\n49\t    raw = os.environ.get(name)\n50\t    if raw is None:\n51\t        return default\n52\t    return raw.strip().lower() not in {\"0\", \"false\", \"no\", \"off\", \"\"}\n53\t\n54\tSEED = 123\n55\tN_SIGNAL = 4000\n56\tN_NOISE = 4000\n57\tTRACE_LEN = 8000\n58\tTRAIN_FRACTION = 0.70\n59\tVAL_FRACTION = 0.15\n60\tEPS = 1e-6\n61\t\n62\tBATCH_SIZE = 32\n63\tEPOCHS = 5\n64\tLEARNING_RATE = 0.0005\n65\tWEIGHT_DECAY = 1e-4\n66\t\n67\tSTAGE_LAYERS = [1, 1, 1]\n68\tKERNEL_SIZE = 7\n69\tDROPOUT = 0.0\n70\t\n71\t\n72\tDEVICE = resolve_device()\n73\tGRAD_CLIP_NORM = 1.0\n74\tMPS_MAX_LEARNING_RATE = 5e-4\n75\tMPS_ADAM_EPS = 1e-4\n76\tLOGIT_CLAMP = 30.0\n77\tRUN_ARCHIVE_DIR = ARTIFACT_DIR / \"run_archive\"\n78\tRUN_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)\n79\t\n80\t# Fast-search mode trades evaluation fidelity for much faster screening loops.\n81\tFAST_SEARCH_MODE = _env_flag(\"RESNET_TRIGGER_FAST_SEARCH\", False)\n82\tFAST_SEARCH_N_SIGNAL = int(os.environ.get(\"RESNET_TRIGGER_FAST_N_SIGNAL\", \"1000\"))\n83\tFAST_SEARCH_N_NOISE = int(os.environ.get(\"RESNET_TRIGGER_FAST_N_NOISE\", \"1000\"))\n84\tFAST_SEARCH_TRACE_LEN = int(os.environ.get(\"RESNET_TRIGGER_FAST_TRACE_LEN\", \"4096\"))\n85\tFAST_SEARCH_BATCH_SIZE = int(os.environ.get(\"RESNET_TRIGGER_FAST_BATCH_SIZE\", \"64\"))\n86\tFAST_SEARCH_EPOCHS = int(os.environ.get(\"RESNET_TRIGGER_FAST_EPOCHS\", \"3\"))\n87\tFAST_SEARCH_SKIP_TEST = _env_flag(\"RESNET_TRIGGER_FAST_SKIP_TEST\", True)\n88\tEARLY_STOPPING_PATIENCE = int(os.environ.get(\"RESNET_TRIGGER_EARLY_STOP_PATIENCE\", \"2\"))\n89\tEARLY_STOPPING_MIN_DELTA = float(os.environ.get(\"RESNET_TRIGGER_EARLY_STOP_MIN_DELTA\", \"0.002\"))\n90\t\n91\t\n92\t@dataclass(frozen=True)\n93\tclass TrainConfig:\n94\t    seed: int\n95\t    data: DataConfig\n96\t    batch_size: int\n97\t    epochs: int\n98\t    learning_rate: float\n99\t    weight_decay: float\n100\t    stage_layers: list[int]\n101\t    kernel_size: int\n102\t    dropout: float\n103\t    fast_search_mode: bool\n104\t    skip_test_eval: bool\n105\t    early_stopping_patience: int\n106\t    early_stopping_min_delta: float\n107\t\n108\t    @property\n109\t    def depth(self) -> int:\n110\t        return int(sum(self.stage_layers))\n111\t\n112\t\n113\tdef build_config() -> TrainConfig:\n114\t    n_signal = FAST_SEARCH_N_SIGNAL if FAST_SEARCH_MODE else N_SIGNAL\n115\t    n_noise = FAST_SEARCH_N_NOISE if FAST_SEARCH_MODE else N_NOISE\n116\t    trace_len = FAST_SEARCH_TRACE_LEN if FAST_SEARCH_MODE else TRACE_LEN\n117\t    batch_size = FAST_SEARCH_BATCH_SIZE if FAST_SEARCH_MODE else BATCH_SIZE\n118\t    epochs = FAST_SEARCH_EPOCHS if FAST_SEARCH_MODE else EPOCHS\n119\t    return TrainConfig(\n120\t        seed=SEED,\n121\t        data=DataConfig(\n122\t            n_signal=n_signal,\n123\t            n_noise=n_noise,\n124\t            trace_len=trace_len,\n125\t            train_frac=TRAIN_FRACTION,\n126\t            val_frac=VAL_FRACTION,\n127\t            eps=EPS,\n128\t        ),\n129\t        batch_size=batch_size,\n130\t        epochs=epochs,\n131\t        learning_rate=LEARNING_RATE,\n132\t        weight_decay=WEIGHT_DECAY,\n133\t        stage_layers=list(STAGE_LAYERS),\n134\t        kernel_size=KERNEL_SIZE,\n135\t        dropout=DROPOUT,\n136\t        fast_search_mode=FAST_SEARCH_MODE,\n137\t        skip_test_eval=FAST_SEARCH_SKIP_TEST if FAST_SEARCH_MODE else False,\n138\t        early_stopping_patience=EARLY_STOPPING_PATIENCE,\n139\t        early_stopping_min_delta=EARLY_STOPPING_MIN_DELTA,\n140\t    )\n141\t\n142\t\n143\tdef set_seed(seed: int) -> None:\n144\t    torch.manual_seed(seed)\n145\t    np.random.seed(seed)\n146\t    if torch.cuda.is_available():\n147\t        torch.cuda.manual_seed_all(seed)\n148\t\n149\t\n150\tdef reset_memory_stats(device: torch.device) -> None:\n151\t    if device.type == \"cuda\":\n152\t        torch.cuda.reset_peak_memory_stats(device)\n153\t\n154\t\n155\tdef load_resnet1d_class() -> type[nn.Module]:\n156\t    try:\n157\t        from resnet_1d import ResNet1D  # type: ignore\n158\t        return ResNet1D\n159\t    except Exception:\n160\t        code = (Path(__file__).resolve().parent / \"resnet_1d.py\").read_text(encoding=\"utf-8\")\n161\t        replacement = (\n162\t            \"from typing import Any\\n\"\n163\t            \"NormLayer = Any\\n\\n\"\n164\t            \"def GroupNorm1DGetter(num_groups: int = 8):\\n\"\n165\t            \"    def _mk(channels: int):\\n\"\n166\t            \"        g = min(num_groups, channels)\\n\"\n167\t            \"        while g > 1 and channels % g != 0:\\n\"\n168\t            \"            g -= 1\\n\"\n169\t            \"        return nn.GroupNorm(g, channels)\\n\"\n170\t            \"    return _mk\\n\"\n171\t        )\n172\t        code = code.replace(\"from ..norm import GroupNorm1DGetter, NormLayer\", replacement)\n173\t        module = types.ModuleType(\"resnet_1d_local\")\n174\t        module.__dict__[\"nn\"] = nn\n175\t        module.__dict__[\"torch\"] = torch\n176\t        exec(code, module.__dict__)\n177\t        return module.ResNet1D\n178\t\n179\t\n180\tclass ResNetTrigger1D(nn.Module):\n181\t    def __init__(self, config: TrainConfig) -> None:\n182\t        super().__init__()\n183\t        ResNet1D = load_resnet1d_class()\n184\t        norm_layer = nn.BatchNorm1d if DEVICE.type == \"mps\" else None\n185\t        self.backbone = ResNet1D(\n186\t            in_channels=1,\n187\t            layers=config.stage_layers,\n188\t            classes=1,\n189\t            kernel_size=config.kernel_size,\n190\t            norm_layer=norm_layer,\n191\t        )\n192\t        self.dropout = nn.Dropout(config.dropout)\n193\t\n194\t    def forward(self, x: torch.Tensor) -> torch.Tensor:\n195\t        logits = self.backbone(x)\n196\t        return self.dropout(logits)\n197\t\n198\t\n199\tdef eval_loader(\n200\t    model: nn.Module,\n201\t    loader: DataLoader,\n202\t    criterion: nn.Module,\n203\t    device: torch.device,\n204\t) -> tuple[float, np.ndarray, np.ndarray]:\n205\t    model.eval()\n206\t    losses: list[float] = []\n207\t    ys: list[np.ndarray] = []\n208\t    probs: list[np.ndarray] = []\n209\t    with torch.no_grad():\n210\t        for xb, yb in loader:\n211\t            xb = xb.to(device, dtype=torch.float32, non_blocking=True)\n212\t            yb = yb.to(device, dtype=torch.float32, non_blocking=True).view(-1, 1)\n213\t            logits = model(xb)\n214\t            if not torch.isfinite(logits).all():\n215\t                raise RuntimeError(\"Non-finite logits detected during evaluation\")\n216\t            logits_for_loss = logits.float().clamp(-LOGIT_CLAMP, LOGIT_CLAMP)\n217\t            loss = criterion(logits_for_loss, yb)\n218\t            losses.append(float(loss.item()))\n219\t            ys.append(yb.detach().cpu().numpy().ravel())\n220\t            probs.append(torch.sigmoid(logits_for_loss).detach().cpu().numpy().ravel())\n221\t    y_true = np.concatenate(ys)\n222\t    y_prob = np.concatenate(probs)\n223\t    return float(np.mean(losses)), y_true, y_prob\n224\t\n225\t\n226\tdef make_loader(x: np.ndarray, y: np.ndarray, batch_size: int, shuffle: bool) -> DataLoader:\n227\t    dataset = TensorDataset(torch.from_numpy(x), torch.from_numpy(y))\n228\t    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=0)\n229\t\n230\t\n231\tdef checkpoint_payload(\n232\t    model: nn.Module,\n233\t    optimizer: torch.optim.Optimizer,\n234\t    config: TrainConfig,\n235\t    best_epoch_row: dict[str, float | int],\n236\t) -> dict[str, object]:\n237\t    return {\n238\t        \"model_state_dict\": model.state_dict(),\n239\t        \"optimizer_state_dict\": optimizer.state_dict(),\n240\t        \"config\": {\n241\t            \"seed\": config.seed,\n242\t            \"batch_size\": config.batch_size,\n243\t            \"epochs\": config.epochs,\n244\t            \"learning_rate\": config.learning_rate,\n245\t            \"weight_decay\": config.weight_decay,\n246\t            \"stage_layers\": config.stage_layers,\n247\t            \"kernel_size\": config.kernel_size,\n248\t            \"dropout\": config.dropout,\n249\t            \"fast_search_mode\": config.fast_search_mode,\n250\t            \"skip_test_eval\": config.skip_test_eval,\n251\t            \"early_stopping_patience\": config.early_stopping_patience,\n252\t            \"early_stopping_min_delta\": config.early_stopping_min_delta,\n253\t            \"data\": config.data.to_dict(),\n254\t        },\n255\t        \"best_epoch\": int(best_epoch_row[\"epoch\"]),\n256\t        \"best_val_auc\": float(best_epoch_row[\"val_auc\"]),\n257\t        \"best_val_loss\": float(best_epoch_row[\"val_loss\"]),\n258\t        \"best_val_pr_auc\": float(best_epoch_row[\"val_pr_auc\"]),\n259\t    }\n260\t\n261\t\n262\tdef archive_run_bundle(\n263\t    config: TrainConfig,\n264\t    split_meta: dict,\n265\t    history: list[dict[str, float | int]],\n266\t    metrics: dict,\n267\t    timing: dict,\n268\t) -> Path:\n269\t    archive_id = f\"run_{int(time.time() * 1000)}\"\n270\t    archive_path = RUN_ARCHIVE_DIR / f\"{archive_id}.json\"\n271\t    archive_payload = {\n272\t        \"archive_id\": archive_id,\n273\t        \"created_at\": time.strftime(\"%Y-%m-%d %H:%M:%S\"),\n274\t        \"config\": {\n275\t            \"seed\": config.seed,\n276\t            \"batch_size\": config.batch_size,\n277\t            \"epochs\": config.epochs,\n278\t            \"learning_rate\": config.learning_rate,\n279\t            \"weight_decay\": config.weight_decay,\n280\t            \"stage_layers\": config.stage_layers,\n281\t            \"kernel_size\": config.kernel_size,\n282\t            \"dropout\": config.dropout,\n283\t            \"fast_search_mode\": config.fast_search_mode,\n284\t            \"skip_test_eval\": config.skip_test_eval,\n285\t            \"early_stopping_patience\": config.early_stopping_patience,\n286\t            \"early_stopping_min_delta\": config.early_stopping_min_delta,\n287\t            \"data\": config.data.to_dict(),\n288\t        },\n289\t        \"split_meta\": split_meta,\n290\t        \"history\": history,\n291\t        \"metrics\": metrics,\n292\t        \"timing\": timing,\n293\t    }\n294\t    archive_path.write_text(json.dumps(archive_payload, indent=2), encoding=\"utf-8\")\n295\t    return archive_path\n296\t\n297\t\n298\tdef main() -> None:\n299\t    config = build_config()\n300\t    set_seed(config.seed)\n301\t    reset_memory_stats(DEVICE)\n302\t\n303\t    prep_t0 = time.perf_counter()\n304\t    x_train, y_train, x_val, y_val, x_test, y_test, split_meta = prepare_run_arrays(config.data, run_seed=config.seed)\n305\t    dataset_prep_seconds = time.perf_counter() - prep_t0\n306\t\n307\t    train_loader = make_loader(x_train, y_train, config.batch_size, shuffle=True)\n308\t    val_loader = make_loader(x_val, y_val, config.batch_size, shuffle=False)\n309\t    test_loader = None if config.skip_test_eval else make_loader(x_test, y_test, config.batch_size, shuffle=False)\n310\t\n311\t    model = ResNetTrigger1D(config).to(DEVICE)\n312\t    criterion = nn.BCEWithLogitsLoss()\n313\t    optimizer_lr = min(config.learning_rate, MPS_MAX_LEARNING_RATE) if DEVICE.type == \"mps\" else config.learning_rate\n314\t    optimizer_eps = MPS_ADAM_EPS if DEVICE.type == \"mps\" else 1e-8\n315\t    optimizer = torch.optim.AdamW(\n316\t        model.parameters(),\n317\t        lr=optimizer_lr,\n318\t        weight_decay=config.weight_decay,\n319\t        eps=optimizer_eps,\n320\t    )\n321\t\n\n...[truncated]",
+        "metadata": {
+          "path": "train.py",
+          "start_line": 1,
+          "end_line": 553,
+          "line_count": 553
+        },
+        "error": null
+      },
+      {
+        "turn": 3,
+        "name": "run_shell_command",
+        "arguments": {
+          "command": "python3 - <<'PY'\nfrom pathlib import Path\nimport json\nimport re\ntarget = Path(\"train.py\")\ntext = target.read_text(encoding='utf-8')\nname = \"KERNEL_SIZE\"\nvalue = \"5\"\npattern = re.compile(rf'^(?P<indent>\\s*){re.escape(name)}\\s*=.*$', flags=re.MULTILINE)\nreplacement = f'{name} = {value}'\nupdated, count = pattern.subn(replacement, text, count=1)\nif count != 1:\n    raise SystemExit(f'assignment not found: {name}')\ntarget.write_text(updated, encoding='utf-8')\nPY",
+          "timeout_seconds": 20
+        },
+        "success": true,
+        "output": "",
+        "metadata": {
+          "exit_code": 0,
+          "command": "python3 - <<'PY'\nfrom pathlib import Path\nimport json\nimport re\ntarget = Path(\"train.py\")\ntext = target.read_text(encoding='utf-8')\nname = \"KERNEL_SIZE\"\nvalue = \"5\"\npattern = re.compile(rf'^(?P<indent>\\s*){re.escape(name)}\\s*=.*$', flags=re.MULTILINE)\nreplacement = f'{name} = {value}'\nupdated, count = pattern.subn(replacement, text, count=1)\nif count != 1:\n    raise SystemExit(f'assignment not found: {name}')\ntarget.write_text(updated, encoding='utf-8')\nPY",
+          "timeout_seconds": 20
+        },
+        "error": null
+      }
+    ],
+    "artifacts": [
+      "train.py"
+    ],
+    "changed_files": [
+      "train.py"
+    ],
+    "verification": {
+      "acceptance_tests": [
+        {
+          "command": "python3 -m py_compile train.py",
+          "success": true,
+          "exit_code": 0,
+          "output": ""
+        }
+      ],
+      "tool_runs": {
+        "run_tests": [],
+        "run_build": []
+      }
+    },
+    "final_answer": "The script executed successfully. The KERNEL_SIZE assignment in train.py has been updated to 5.",
+    "stop_reason": "completed",
+    "turns": 4,
+    "trace_events": []
+  },
+  "last_error": null
+}
