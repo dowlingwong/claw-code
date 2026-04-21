@@ -6104,3 +6104,42 @@ Then pass `denied_tools=denials` to every `submit_message` call inside the loop.
 **Blocker.** None.
 
 **Source.** Jobdori dogfood sweep 2026-04-22 06:46 KST — diffed `bootstrap_session` vs `run_turn_loop` in `src/runtime.py`, confirmed asymmetric permission denial propagation.
+
+## Pinpoint #160. `session_store` has no `list_sessions`, `delete_session`, or `session_exists` — claw cannot enumerate or clean up sessions without filesystem hacks
+
+**Gap.** `src/session_store.py` exposes exactly two public functions: `save_session` and `load_session`. There is no `list_sessions`, `delete_session`, or `session_exists`. Any claw that needs to enumerate stored sessions, verify a session exists before loading (to avoid `FileNotFoundError`), or clean up stale sessions must reach past the module and glob `DEFAULT_SESSION_DIR` directly. This couples callers to the on-disk layout (`<dir>/<session_id>.json`) and makes it impossible to swap storage backends (e.g., sqlite, remote store) without touching every call site.
+
+**Repro.**
+```python
+import sys; sys.path.insert(0, 'src')
+import session_store, inspect
+print([n for n, _ in inspect.getmembers(session_store, inspect.isfunction)
+       if not n.startswith('_')])
+# ['asdict', 'dataclass', 'load_session', 'save_session']
+# list_sessions, delete_session, session_exists — all absent
+```
+
+Try to enumerate sessions without the module:
+```python
+from pathlib import Path
+sessions = list((Path('.port_sessions')).glob('*.json'))
+# Works today, breaks if the dir layout ever changes — no abstraction layer
+```
+
+Try to load a session that doesn't exist:
+```python
+load_session('nonexistent')  # raises FileNotFoundError with no structured error type
+```
+
+**Root cause.** `src/session_store.py` was scaffolded with the minimum needed to save/load a single session and was never extended with the CRUD surface a claw actually needs to manage session lifecycle.
+
+**Fix shape (~25 lines).**
+1. `list_sessions(directory: Path | None = None) -> list[str]` — glob `*.json` in target dir, return sorted session ids (filename stems). Claws can call this to discover all stored sessions without touching the filesystem directly.
+2. `session_exists(session_id: str, directory: Path | None = None) -> bool` — `(target_dir / f'{session_id}.json').exists()`. Use before `load_session` to get a bool check instead of catching `FileNotFoundError`.
+3. `delete_session(session_id: str, directory: Path | None = None) -> bool` — unlink the file if present, return True on success, False if not found. Claws can use this for cleanup without knowing the path scheme.
+
+**Acceptance.** A claw can call `list_sessions()`, `session_exists(id)`, and `delete_session(id)` without importing `Path` or knowing the `.port_sessions/<id>.json` layout. `load_session` on a missing id raises a typed `SessionNotFoundError` subclass of `KeyError` (not `FileNotFoundError`) so callers can distinguish "not found" from IO errors.
+
+**Blocker.** None.
+
+**Source.** Jobdori dogfood sweep 2026-04-22 08:46 KST — inspected `src/session_store.py` public API, confirmed only `save_session` + `load_session` present, no list/delete/exists surface.
