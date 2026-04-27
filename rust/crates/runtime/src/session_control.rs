@@ -31,14 +31,19 @@ impl SessionStore {
     /// The on-disk layout becomes `<cwd>/.claw/sessions/<workspace_hash>/`.
     pub fn from_cwd(cwd: impl AsRef<Path>) -> Result<Self, SessionControlError> {
         let cwd = cwd.as_ref();
-        let sessions_root = cwd
+        // #151: canonicalize so equivalent paths (symlinks, relative vs
+        // absolute, /tmp vs /private/tmp on macOS) produce the same
+        // workspace_fingerprint. Falls back to the raw path if canonicalize
+        // fails (e.g. the directory doesn't exist yet).
+        let canonical_cwd = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        let sessions_root = canonical_cwd
             .join(".claw")
             .join("sessions")
-            .join(workspace_fingerprint(cwd));
+            .join(workspace_fingerprint(&canonical_cwd));
         fs::create_dir_all(&sessions_root)?;
         Ok(Self {
             sessions_root,
-            workspace_root: cwd.to_path_buf(),
+            workspace_root: canonical_cwd,
         })
     }
 
@@ -51,14 +56,18 @@ impl SessionStore {
         workspace_root: impl AsRef<Path>,
     ) -> Result<Self, SessionControlError> {
         let workspace_root = workspace_root.as_ref();
+        // #151: canonicalize workspace_root for consistent fingerprinting
+        // across equivalent path representations.
+        let canonical_workspace =
+            fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
         let sessions_root = data_dir
             .as_ref()
             .join("sessions")
-            .join(workspace_fingerprint(workspace_root));
+            .join(workspace_fingerprint(&canonical_workspace));
         fs::create_dir_all(&sessions_root)?;
         Ok(Self {
             sessions_root,
-            workspace_root: workspace_root.to_path_buf(),
+            workspace_root: canonical_workspace,
         })
     }
 
@@ -103,7 +112,7 @@ impl SessionStore {
             candidate
         } else if looks_like_path {
             return Err(SessionControlError::Format(
-                format_missing_session_reference(reference),
+                format_missing_session_reference(reference, &self.sessions_root),
             ));
         } else {
             self.resolve_managed_path(reference)?
@@ -134,7 +143,7 @@ impl SessionStore {
             }
         }
         Err(SessionControlError::Format(
-            format_missing_session_reference(session_id),
+            format_missing_session_reference(session_id, &self.sessions_root),
         ))
     }
 
@@ -149,10 +158,9 @@ impl SessionStore {
     }
 
     pub fn latest_session(&self) -> Result<ManagedSessionSummary, SessionControlError> {
-        self.list_sessions()?
-            .into_iter()
-            .next()
-            .ok_or_else(|| SessionControlError::Format(format_no_managed_sessions()))
+        self.list_sessions()?.into_iter().next().ok_or_else(|| {
+            SessionControlError::Format(format_no_managed_sessions(&self.sessions_root))
+        })
     }
 
     pub fn load_session(
@@ -513,15 +521,25 @@ fn session_id_from_path(path: &Path) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn format_missing_session_reference(reference: &str) -> String {
+fn format_missing_session_reference(reference: &str, sessions_root: &Path) -> String {
+    // #80: show the actual workspace-fingerprint directory instead of lying about .claw/sessions/
+    let fingerprint_dir = sessions_root
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("<unknown>");
     format!(
-        "session not found: {reference}\nHint: managed sessions live in .claw/sessions/. Try `{LATEST_SESSION_REFERENCE}` for the most recent session or `/session list` in the REPL."
+        "session not found: {reference}\nHint: managed sessions live in .claw/sessions/{fingerprint_dir}/ (workspace-specific partition).\nTry `{LATEST_SESSION_REFERENCE}` for the most recent session or `/session list` in the REPL."
     )
 }
 
-fn format_no_managed_sessions() -> String {
+fn format_no_managed_sessions(sessions_root: &Path) -> String {
+    // #80: show the actual workspace-fingerprint directory instead of lying about .claw/sessions/
+    let fingerprint_dir = sessions_root
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("<unknown>");
     format!(
-        "no managed sessions found in .claw/sessions/\nStart `claw` to create a session, then rerun with `--resume {LATEST_SESSION_REFERENCE}`."
+        "no managed sessions found in .claw/sessions/{fingerprint_dir}/\nStart `claw` to create a session, then rerun with `--resume {LATEST_SESSION_REFERENCE}`.\nNote: claw partitions sessions per workspace fingerprint; sessions from other CWDs are invisible."
     )
 }
 
@@ -744,6 +762,40 @@ mod tests {
         assert_eq!(fp_a1.len(), 16, "fingerprint must be a 16-char hex string");
     }
 
+    /// #151 regression: equivalent paths (e.g. `/tmp/foo` vs `/private/tmp/foo`
+    /// on macOS where `/tmp` is a symlink to `/private/tmp`) must resolve to
+    /// the same session store. Previously they diverged because
+    /// `workspace_fingerprint()` hashed the raw path string. Now
+    /// `SessionStore::from_cwd()` canonicalizes first.
+    #[test]
+    fn session_store_from_cwd_canonicalizes_equivalent_paths() {
+        let base = temp_dir();
+        let real_dir = base.join("real-workspace");
+        fs::create_dir_all(&real_dir).expect("real workspace should exist");
+
+        // Build two stores via different but equivalent path representations:
+        // the raw path and the canonicalized path.
+        let raw_path = real_dir.clone();
+        let canonical_path = fs::canonicalize(&real_dir).expect("canonicalize ok");
+
+        let store_from_raw =
+            SessionStore::from_cwd(&raw_path).expect("store from raw should build");
+        let store_from_canonical =
+            SessionStore::from_cwd(&canonical_path).expect("store from canonical should build");
+
+        assert_eq!(
+            store_from_raw.sessions_dir(),
+            store_from_canonical.sessions_dir(),
+            "equivalent paths must produce the same sessions dir (raw={} canonical={})",
+            raw_path.display(),
+            canonical_path.display()
+        );
+
+        if base.exists() {
+            fs::remove_dir_all(base).expect("cleanup ok");
+        }
+    }
+
     #[test]
     fn session_store_from_cwd_isolates_sessions_by_workspace() {
         // given
@@ -832,6 +884,11 @@ mod tests {
         let workspace_b = base.join("repo-beta");
         fs::create_dir_all(&workspace_a).expect("workspace a should exist");
         fs::create_dir_all(&workspace_b).expect("workspace b should exist");
+        // #151: canonicalize so test expectations match the store's canonical
+        // workspace_root. Without this, the test builds sessions with a raw
+        // path but the store resolves to the canonical form.
+        let workspace_a = fs::canonicalize(&workspace_a).unwrap_or(workspace_a);
+        let workspace_b = fs::canonicalize(&workspace_b).unwrap_or(workspace_b);
 
         let store_b = SessionStore::from_cwd(&workspace_b).expect("store b should build");
         let legacy_root = workspace_b.join(".claw").join("sessions");
@@ -865,6 +922,8 @@ mod tests {
         // given
         let base = temp_dir();
         fs::create_dir_all(&base).expect("base dir should exist");
+        // #151: canonicalize for path-representation consistency with store.
+        let base = fs::canonicalize(&base).unwrap_or(base);
         let store = SessionStore::from_cwd(&base).expect("store should build");
         let legacy_root = base.join(".claw").join("sessions");
         let legacy_path = legacy_root.join("legacy-safe.jsonl");
@@ -893,6 +952,8 @@ mod tests {
         // given
         let base = temp_dir();
         fs::create_dir_all(&base).expect("base dir should exist");
+        // #151: canonicalize for path-representation consistency with store.
+        let base = fs::canonicalize(&base).unwrap_or(base);
         let store = SessionStore::from_cwd(&base).expect("store should build");
         let legacy_root = base.join(".claw").join("sessions");
         let legacy_path = legacy_root.join("legacy-unbound.json");

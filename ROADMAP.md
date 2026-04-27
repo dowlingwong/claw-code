@@ -107,6 +107,20 @@ Acceptance:
 - long silent gaps between ready-state and first-task execution become machine-visible
 - recovery can trigger on acceptance timeout before humans start scraping panes
 
+### 1.6. `startup-no-evidence` evidence bundle + classifier
+Dogfooded 2026-04-16. Team worker startup can stall in a vague `startup-no-evidence` state even when the real failure mode is more specific (trust prompt, shell misdelivery, prompt never accepted, transport death, or crashed worker). Claws currently have to infer too much from pane noise after the fact.
+
+Required behavior:
+- when startup times out, emit a typed `worker.startup_no_evidence` event with an attached evidence bundle
+- evidence bundle should include last known worker lifecycle state, pane command, prompt-send timestamp, prompt-acceptance state, trust-prompt detection result, and transport/MCP health summary
+- classifier should attempt to down-rank the vague bucket into one of: `trust_required`, `prompt_misdelivery`, `prompt_acceptance_timeout`, `transport_dead`, `worker_crashed`, or `unknown`
+- keep the raw `startup-no-evidence` marker only as a fallback when no stronger classification exists
+
+Acceptance:
+- a claw can report why startup stalled without manually scraping tmux output
+- repeated `startup-no-evidence` incidents become clusterable by real root-cause class
+- clawhip summaries can say `worker stalled: prompt acceptance timeout` instead of a human-only mystery label
+
 ### 2. Trust prompt resolver
 Add allowlisted auto-trust behavior for known repos/worktrees.
 
@@ -830,6 +844,49 @@ Acceptance:
 - channel status updates stay short and machine-grounded
 - claws stop inferring state from raw build spam
 
+### 140. Deprecated `permissionMode` migration silently downgrades `DangerFullAccess` to `WorkspaceWrite`
+
+**Filed:** 2026-04-21 from dogfood cycle — `cargo test --workspace` on `main` HEAD `36b3a09` shows 1 deterministic failure.
+
+**Problem:** `tests::punctuation_bearing_single_token_still_dispatches_to_prompt` fails with:
+```
+assert left == right failed
+  left:  ... permission_mode: WorkspaceWrite ...
+  right: ... permission_mode: DangerFullAccess ...
+warning: .claw/settings.json: field "permissionMode" is deprecated (line 1). Use "permissions.defaultMode" instead
+```
+The test fixture writes a `.claw/settings.json` with the deprecated `permissionMode: "dangerFullAccess"` key. The migration/deprecation shim reads it but resolves to `WorkspaceWrite` instead of `DangerFullAccess`. Result: `cargo test --workspace` is red on `main` with 172 passing, 1 failing.
+
+**Root cause hypothesis:** The deprecated field reader in `parse_args` or `ConfigLoader` applies the `permissionMode` value through a permission-mode resolver that does not map `"dangerFullAccess"` to `PermissionMode::DangerFullAccess`, likely defaulting or falling back to `WorkspaceWrite`.
+
+**Fix shape:**
+- Ensure the deprecated-key migration path correctly maps `permissionMode: "dangerFullAccess"` → `PermissionMode::DangerFullAccess` (same as `permissions.defaultMode: "dangerFullAccess"`).
+- Alternatively, update the test fixture to use the canonical `permissions.defaultMode` key so it exercises the migration shim rather than depending on it.
+- Verify `cargo test --workspace` returns 0 failures.
+
+**Acceptance:**
+- `cargo test --workspace` passes with 0 failures on `main`.
+- Deprecated `permissionMode: "dangerFullAccess"` migrates cleanly to `DangerFullAccess` without downgrading to `WorkspaceWrite`.
+
+### 137. Model-alias shorthand regression in test suite — bare alias parsing broken on `feat/134-135-session-identity` branch
+
+**Filed:** 2026-04-21 from dogfood cycle — `cargo test --workspace` on `feat/134-135-session-identity` HEAD (`91ba54d`) shows 3 failing tests.
+
+**Problem:** `tests::parses_bare_prompt_and_json_output_flag`, `tests::multi_word_prompt_still_uses_shorthand_prompt_mode`, and `tests::env_permission_mode_overrides_project_config_default` all panic with:
+```
+args should parse: "invalid model syntax: 'claude-opus'. Expected provider/model (e.g., anthropic/claude-opus-4-6) or known alias (opus, sonnet, haiku)"
+```
+The #134/#135 session-identity work tightened model-syntax validation but the test fixtures still pass bare `claude-opus` style strings that the new validator rejects. 162 tests pass; only the three tests using legacy bare-alias model names fail.
+
+**Fix shape:**
+- Update the three failing test fixtures to use either a valid alias (`opus`, `sonnet`, `haiku`) or a fully-qualified model id (`anthropic/claude-opus-4-6`)
+- Alternatively, if `claude-opus` is an intended supported alias, add it to the alias registry
+- Verify `cargo test --workspace` returns 0 failures before merging the feat branch to `main`
+
+**Acceptance:**
+- `cargo test --workspace` passes with 0 failures on the `feat/134-135-session-identity` branch
+- No regression on the 162 tests currently passing
+
 ### 133. Blocked-state subphase contract (was §6.5)
 **Filed:** 2026-04-20 from dogfood cycle — previous cycle identified §4.44.5 provenance gap, this cycle targets §6.5 implementation.
 
@@ -1053,6 +1110,7 @@ Priority order: P0 = blocks CI/green state, P1 = blocks integration wiring, P2 =
 27. **`dev/rust` `cargo test -p rusty-claude-cli` reads host `~/.claude/plugins/installed/` from real `$HOME` and fails parse-time on any half-installed user plugin** — dogfooding on 2026-04-08 (filed from gaebal-gajae's clawhip bullet at message `1491322807026454579` after the provider-matrix branch QA surfaced it) reproduced 11 deterministic failures on clean `dev/rust` HEAD of the form `panicked at crates/rusty-claude-cli/src/main.rs:3953:31: args should parse: "hook path \`/Users/yeongyu/.claude/plugins/installed/sample-hooks-bundled/./hooks/pre.sh\` does not exist; hook path \`...\post.sh\` does not exist"` covering `parses_prompt_subcommand`, `parses_permission_mode_flag`, `defaults_to_repl_when_no_args`, `parses_resume_flag_with_slash_command`, `parses_system_prompt_options`, `parses_bare_prompt_and_json_output_flag`, `rejects_unknown_allowed_tools`, `parses_resume_flag_with_multiple_slash_commands`, `resolves_model_aliases_in_args`, `parses_allowed_tools_flags_with_aliases_and_lists`, `parses_login_and_logout_subcommands`. **Same failures do NOT reproduce on `main`** (re-verified with `cargo test --release -p rusty-claude-cli` against `main` HEAD `79da4b8`, all 156 tests pass). **Root cause is two-layered.** First, on `dev/rust` `parse_args` eagerly walks user-installed plugin manifests under `~/.claude/plugins/installed/` and validates that every declared hook script exists on disk before returning a `CliAction`, so any half-installed plugin in the developer's real `$HOME` (in this case `~/.claude/plugins/installed/sample-hooks-bundled/` whose `.claude-plugin` manifest references `./hooks/pre.sh` and `./hooks/post.sh` but whose `hooks/` subdirectory was deleted) makes argv parsing itself fail. Second, the test harness on `dev/rust` does not redirect `$HOME` or `XDG_CONFIG_HOME` to a fixture for the duration of the test — there is no `env_lock`-style guard equivalent to the one `main` already uses (`grep -n env_lock rust/crates/rusty-claude-cli/src/main.rs` returns 0 hits on `dev/rust` and 30+ hits on `main`). Together those two gaps mean `dev/rust` `cargo test -p rusty-claude-cli` is non-deterministic on every clean clone whose owner happens to have any non-pristine plugin in `~/.claude/`. **Action (two parts).** (a) Backport the `env_lock`-based test isolation pattern from `main` into `dev/rust`'s `rusty-claude-cli` test module so each test runs against a temp `$HOME`/`XDG_CONFIG_HOME` and cannot read host plugin state. (b) Decouple `parse_args` from filesystem hook validation on `dev/rust` (the same decoupling already on `main`, where hook validation happens later in the lifecycle than argv parsing) so even outside tests a partially installed user plugin cannot break basic CLI invocation. **Branch scope.** This is a `dev/rust` catchup against `main`, not a `main` regression. Tracking it here so the dev/rust merge train picks it up before the next dev/rust release rather than rediscovering it in CI.
 28. **Auth-provider truth: error copy fails real users at the env-var-vs-header layer** — dogfooded live on 2026-04-08 in #claw-code (Sisyphus Labs guild), two separate new users hit adjacent failure modes within minutes of each other that both trace back to the same root: the `MissingApiKey` / 401 error surface does not teach users how the auth inputs map to HTTP semantics, so a user who sets a "reasonable-looking" env var still hits a hard error with no signpost. **Case 1 (varleg, Norway).** Wanted to use OpenRouter via the OpenAI-compat path. Found a comparison table claiming "provider-agnostic (Claude, OpenAI, local models)" and assumed it Just Worked. Set `OPENAI_API_KEY` to an OpenRouter `sk-or-v1-...` key and a model name without an `openai/` prefix; claw's provider detection fell through to Anthropic first because `ANTHROPIC_API_KEY` was still in the environment. Unsetting `ANTHROPIC_API_KEY` got them `ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY is not set` instead of a useful hint that the OpenAI path was right there. Fix delivered live as a channel reply: use `main` branch (not `dev/rust`), export `OPENAI_BASE_URL=https://openrouter.ai/api/v1` alongside `OPENAI_API_KEY`, and prefix the model name with `openai/` so the prefix router wins over env-var presence. **Case 2 (stanley078852).** Had set `ANTHROPIC_AUTH_TOKEN="sk-ant-..."` and was getting 401 `Invalid bearer token` from Anthropic. Root cause: `sk-ant-` keys are `x-api-key`-header keys, not bearer tokens. `ANTHROPIC_API_KEY` path in `anthropic.rs` sends the value as `x-api-key`; `ANTHROPIC_AUTH_TOKEN` path sends it as `Authorization: Bearer` (for OAuth access tokens from `claw login`). Setting an `sk-ant-` key in the wrong env var makes claw send it as `Bearer sk-ant-...` which Anthropic rejects at the edge with 401 before it ever reaches the completions endpoint. The error text propagated all the way to the user (`api returned 401 Unauthorized (authentication_error) ... Invalid bearer token`) with zero signal that the problem was env-var choice, not key validity. Fix delivered live as a channel reply: move the `sk-ant-...` key to `ANTHROPIC_API_KEY` and unset `ANTHROPIC_AUTH_TOKEN`. **Pattern.** Both cases are failures at the *auth-intent translation* layer: the user chose an env var that made syntactic sense to them (`OPENAI_API_KEY` for OpenAI, `ANTHROPIC_AUTH_TOKEN` for Anthropic auth) but the actual wire-format routing requires a more specific choice. The error messages surface the HTTP-layer symptom (401, missing-key) without bridging back to "which env var should you have used and why." **Action.** Three concrete improvements, scoped for a single `main`-side PR: (a) In `ApiError::MissingCredentials` Display, when the Anthropic path is the one being reported but `OPENAI_API_KEY`, `XAI_API_KEY`, or `DASHSCOPE_API_KEY` are present in the environment, extend the message with "— but I see `$OTHER_KEY` set; if you meant to use that provider, prefix your model name with `openai/`, `grok`, or `qwen/` respectively so prefix routing selects it." (b) In the 401-from-Anthropic error path in `anthropic.rs`, when the failing auth source is `BearerToken` AND the bearer token starts with `sk-ant-`, append "— looks like you put an `sk-ant-*` API key in `ANTHROPIC_AUTH_TOKEN`, which is the Bearer-header path. Move it to `ANTHROPIC_API_KEY` instead (that env var maps to `x-api-key`, which is the correct header for `sk-ant-*` keys)." Same treatment for OAuth access tokens landing in `ANTHROPIC_API_KEY` (symmetric mis-assignment). (c) In `rust/README.md` on `main` and the matrix section on `dev/rust`, add a short "Which env var goes where" paragraph mapping `sk-ant-*` → `ANTHROPIC_API_KEY` and OAuth access token → `ANTHROPIC_AUTH_TOKEN`, with the one-line explanation of `x-api-key` vs `Authorization: Bearer`. **Verification path.** Both improvements can be tested with unit tests against `ApiError::fmt` output (the prefix-routing hint) and with a targeted integration test that feeds an `sk-ant-*`-shaped token into `BearerToken` and asserts the fmt output surfaces the correction hint (no HTTP call needed). **Source.** Live users in #claw-code at `1491328554598924389` (varleg) and `1491329840706486376` (stanley078852) on 2026-04-08. **Partial landing (`ff1df4c`).** Action parts (a), (b), (c) shipped on `main`: `MissingCredentials` now carries an optional hint field and renders adjacent-provider signals, Anthropic 401 + `sk-ant-*` bearer gets a correction hint, USAGE.md has a "Which env var goes where" section. BUT the copy fix only helps users who fell through to the Anthropic auth path by accident — it does NOT fix the underlying routing bug where the CLI instantiates `AnthropicRuntimeClient` unconditionally and ignores prefix routing at the runtime-client layer. That deeper routing gap is tracked separately as #29 below and was filed within hours of #28 landing when live users still hit `missing Anthropic credentials` with `--model openai/gpt-4` and all `ANTHROPIC_*` env vars unset.
 29. **CLI provider dispatch is hardcoded to Anthropic, ignoring prefix routing** — **done at `8dc6580` on 2026-04-08**. Changed `AnthropicRuntimeClient.client` from concrete `AnthropicClient` to `ApiProviderClient` (the api crate's `ProviderClient` enum), which dispatches to Anthropic / xAI / OpenAi at construction time based on `detect_provider_kind(&resolved_model)`. 1 file, +59 −7, all 182 rusty-claude-cli tests pass, CI green at run `24125825431`. Users can now run `claw --model openai/gpt-4.1-mini prompt "hello"` with only `OPENAI_API_KEY` set and it routes correctly. **Original filing below for the trace record.** Dogfooded live on 2026-04-08 within hours of ROADMAP #28 landing. Users in #claw-code (nicma at `1491342350960562277`, Jengro at `1491345009021030533`) followed the exact "use main, set OPENAI_API_KEY and OPENAI_BASE_URL, unset ANTHROPIC_*, prefix the model with `openai/`" checklist from the #28 error-copy improvements AND STILL hit `error: missing Anthropic credentials; export ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY before calling the Anthropic API`. **Reproduction on `main` HEAD `ff1df4c`:** `unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN; export OPENAI_API_KEY=sk-...; export OPENAI_BASE_URL=https://api.openai.com/v1; claw --model openai/gpt-4 prompt 'test'` → reproduces the error deterministically. **Root cause (traced).** `rust/crates/rusty-claude-cli/src/main.rs` at `build_runtime_with_plugin_state` (line ~6221) unconditionally builds `AnthropicRuntimeClient::new(session_id, model, ...)` without consulting `providers::detect_provider_kind(&model)`. `BuiltRuntime` at line ~2855 is statically typed as `ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>`, so even if the dispatch logic existed there would be nowhere to slot an alternative client. `providers/mod.rs::metadata_for_model` correctly identifies `openai/gpt-4` as `ProviderKind::OpenAi` at the metadata layer — the routing decision is *computed* correctly, it's just *never used* to pick a runtime client. The result is that the CLI is structurally single-provider (Anthropic only) even though the `api` crate's `openai_compat.rs`, `XAI_ENV_VARS`, `DASHSCOPE_ENV_VARS`, and `send_message_streaming` all exist and are exercised by unit tests inside the `api` crate. The provider matrix in `rust/README.md` is misleading because it describes the api-crate capabilities, not the CLI's actual dispatch behaviour. **Why #28 didn't catch this.** ROADMAP #28 focused on the `MissingCredentials` error *message* (adding hints when adjacent provider env vars are set, or when a bearer token starts with `sk-ant-*`). None of its tests exercised the `build_runtime` code path — they were all unit tests against `ApiError::fmt` output. The routing bug survives #28 because the `Display` improvements fire AFTER the hardcoded Anthropic client has already been constructed and failed. You need the CLI to dispatch to a different client in the first place for the new hints to even surface at the right moment. **Action (single focused commit).** (1) New `OpenAiCompatRuntimeClient` struct in `rust/crates/rusty-claude-cli/src/main.rs` mirroring `AnthropicRuntimeClient` but delegating to `openai_compat::send_message_streaming`. One client type handles OpenAI, xAI, DashScope, and any OpenAI-compat endpoint — they differ only in base URL and auth env var, both of which come from the `ProviderMetadata` returned by `metadata_for_model`. (2) New enum `DynamicApiClient { Anthropic(AnthropicRuntimeClient), OpenAiCompat(OpenAiCompatRuntimeClient) }` that implements `runtime::ApiClient` by matching on the variant and delegating. (3) Retype `BuiltRuntime` from `ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>` to `ConversationRuntime<DynamicApiClient, CliToolExecutor>`, update the Deref/DerefMut/new spots. (4) In `build_runtime_with_plugin_state`, call `detect_provider_kind(&model)` and construct either variant of `DynamicApiClient`. Prefix routing wins over env-var presence (that's the whole point). (5) Integration test using a mock OpenAI-compat server (reuse `mock_parity_harness` pattern from `crates/api/tests/`) that feeds `claw --model openai/gpt-4 prompt 'test'` with `OPENAI_BASE_URL` pointed at the mock and no `ANTHROPIC_*` env vars, asserts the request reaches the mock, and asserts the response round-trips as an `AssistantEvent`. (6) Unit test that `build_runtime_with_plugin_state` with `model="openai/gpt-4"` returns a `BuiltRuntime` whose inner client is the `DynamicApiClient::OpenAiCompat` variant. **Verification.** `cargo test --workspace`, `cargo fmt --all`, `cargo clippy --workspace`. **Source.** Live users nicma (`1491342350960562277`) and Jengro (`1491345009021030533`) in #claw-code on 2026-04-08, within hours of #28 landing.
+30. **Immediate-backlog visibility gap: active dogfood pinpoints are easy to rediscover because ROADMAP lacks a concise in-progress board** — dogfooding on 2026-04-21 surfaced a softer but recurring clawability failure: there are real active branches/sessions (`claw-code-issue-21-resumed-status-json`, `claw-code-issue-24-plugin-lifecycle-flake`, `claw-code-issue-33-xai-integration`), but a claw doing a fresh sweep still has to scrape tmux names, branch diffs, and long-form ROADMAP prose to answer a simple question: "what pinpoint is already active right now, and what delta is in flight?" The result is rediscovery churn, duplicate reporting, and weak handoff quality even when the actual engineering work is already moving. **Concrete gap.** `ROADMAP.md` has rich long-form entries and a large done/archive surface, but no compact machine-friendly `In Progress Now` section that binds `{roadmap_id, pinpoint, owner/session, branch, status, blocker}`. **Action.** Add a small top-of-file/current-work section (or generated JSON companion) that lists only active dogfood items with stable ids and lifecycle state, and require dogfood updates to reference that id when reporting progress. Minimum fields: item id, lifecycle state, current session/branch, one-line delta, blocker/none, last-updated timestamp. **Acceptance.** A fresh claw can answer "what is active now?" from one short section without scraping panes, and repeat dogfood nudges can distinguish `already in progress` from `new pinpoint` automatically.
 
 41. **Phantom completions root cause: global session store has no per-worktree isolation** —
 
@@ -4772,7 +4830,19 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
 
      **Source.** Jobdori dogfood 2026-04-20 against `/tmp/claw-dogfood` (env-cleaned, no git, no config) on main HEAD `7370546` in response to Clawhip pinpoint nudge at `1495620050424434758`. Joins **Silent-flag / documented-but-unenforced** (#96–#101, #104, #108, #111, #115, #116, #117, #118, #119, #121, #122, #123, #124, #126) as 18th — `--json` silently swallowed into Prompt dispatch instead of being recognized or rejected. Joins **Parser-level trust gap quintet** (#108, #117, #119, #122, **#127**) as 5th — same `_other => Prompt` fall-through arm, fifth distinct entry case (#108 = typoed verb, #117 = `-p` greedy, #119 = bare slash + arg, #122 = `--base-commit` greedy, **#127 = valid verb + unrecognized suffix arg**). Joins **Cred-error misdirection / failure-classification gaps** as a sibling of #99 (system-prompt unvalidated) — same family of "local diagnostic verb pretends to need API creds." Joins **Truth-audit / diagnostic-integrity** (#80–#87, #89, #100, #102, #103, #105, #107, #109, #110, #112, #114, #115, #125) — `claw --help` lies about per-verb accepted flags. Joins **Parallel-entry-point asymmetry** (#91, #101, #104, #105, #108, #114, #117, #122, #123, #124) as 11th — three working forms and one broken form for the same logical intent (`--json` doctor output). Joins **Claude Code migration parity** (#103, #109, #116) as 4th — Claude Code's `--json` convention shorthand is unrecognized in claw-code's verb-suffix position; users migrating get cred errors instead. Cross-cluster with **README/USAGE doc-vs-implementation gap** — README explicitly recommends `claw doctor` as the first health check; the natural JSON form of that exact command is broken. Natural bundle: **#108 + #117 + #119 + #122 + #127** — parser-level trust gap quintet: complete `_other => Prompt` fall-through audit (typoed verb + greedy `-p` + bare slash-verb + greedy `--base-commit` + valid verb + unrecognized suffix). Also **#99 + #127** — local-diagnostic cred-error misdirection pair: `system-prompt` and verb-suffix `--json` both pretend to need creds for pure-local operations. Also **#126 + #127** — diagnostic-verb surface integrity pair: `/config` section args ignored (#126) + verb-suffix args silently mis-dispatched (#127). Session tally: ROADMAP #127.
 
-128. **`claw --model <malformed>` (spaces, empty string, special chars, invalid provider/model syntax) silently falls through to API-layer cred error instead of rejecting at parse time** — dogfooded 2026-04-20 on main HEAD `d284ef7` from a fresh environment (no config, no auth). The `--model` flag accepts any string without syntactic validation: spaces (`claw --model "bad model"`), empty strings (`claw --model ""`), special characters (`claw --model "@invalid"`), non-existent provider/model combinations all parse successfully. The malformed model string then flows into the runtime's provider-detection layer, which silently accepts it as Anthropic fallback or passes it to an API layer that fails with `missing Anthropic credentials` (misdirection) rather than a clear "invalid model syntax" error at parse time. With API credentials configured, a malformed model string gets sent to the API, billing tokens against a request that should have failed client-side.
+128. **[CLOSED 2026-04-21]** **`claw --model <malformed>` (spaces, empty string, special chars, invalid provider/model syntax) silently falls through to API-layer cred error instead of rejecting at parse time** — dogfooded 2026-04-20 on main HEAD `d284ef7` from a fresh environment (no config, no auth). The `--model` flag accepts any string without syntactic validation: spaces (`claw --model "bad model"`), empty strings (`claw --model ""`), special characters (`claw --model "@invalid"`), non-existent provider/model combinations all parse successfully. The malformed model string then flows into the runtime's provider-detection layer, which silently accepts it as Anthropic fallback or passes it to an API layer that fails with `missing Anthropic credentials` (misdirection) rather than a clear "invalid model syntax" error at parse time. With API credentials configured, a malformed model string gets sent to the API, billing tokens against a request that should have failed client-side.
+
+     **Closure (2026-04-21):** Re-verified on main HEAD `4cb8fa0`. All cases now rejected at parse time:
+     ```
+     $ claw --model '' status           → error: model string cannot be empty
+     $ claw --model 'bad model' status  → error: invalid model syntax: 'bad model' contains spaces
+     $ claw --model 'sonet' status      → error: invalid model syntax: 'sonet'. Expected provider/model ...
+     $ claw --model '@invalid' status   → error: invalid model syntax: '@invalid'. Expected provider/model ...
+     $ claw --model 'totally-not-real-xyz' status → error: invalid model syntax ...
+     $ claw --model sonnet status       → ok, resolves to claude-sonnet-4-6
+     $ claw --model anthropic/claude-opus-4-6 status → ok, passes through
+     ```
+     Validation happens in `validate_model_syntax()` before `resolve_model_alias_with_config()`. All `--model` and `--model=` parse paths call it. No API call ever reached with malformed input. Residual gap (model provenance in status JSON — raw input vs resolved value) was split off as #148 (see below).
 
 129. **MCP server startup blocks credential validation — `claw <prompt>` with any `.claw.json` `mcpServers` entry awaits the MCP server's stdio handshake BEFORE checking whether the operator has Anthropic credentials. With no `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` set and `mcpServers.everything = { command: "npx", args: ["-y", "@modelcontextprotocol/server-everything"] }` configured, the CLI hangs forever (verified via `timeout 30s` — still in MCP startup at 30s with three repeated `"Starting default (STDIO) server..."` lines), instead of fail-fasting with the same `missing Anthropic credentials` error that fires in milliseconds when no MCP is configured. A misconfigured-but-running MCP server (one that spawns successfully but never completes its `initialize` handshake) wedges every `claw <prompt>` invocation permanently. A misconfigured MCP server with a slow-but-eventually-succeeding init (npx download, container pull, network roundtrip) burns startup latency on every Prompt invocation regardless of whether the LLM call would even succeed. This is the runtime-side companion to #102's config-time MCP diagnostic gap: #102 says doctor doesn't surface MCP reachability; #129 says the Prompt path's reachability check is implicit, blocking, retried, and runs *before* the cheaper auth precondition that should run first** — dogfooded 2026-04-20 on main HEAD `d284ef7` from `/tmp/claw-mcp-test` with `env -i PATH=$PATH HOME=$HOME` (all auth env vars unset).
 
@@ -5014,3 +5084,1173 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
    **Blocker.** None. Reuses existing `stale_base` module; no new logic needed, just a missing call site.
 
    **Source.** Jobdori dogfood 2026-04-20 against `/tmp/jobdori-129-mcp-cred-order` + `/tmp/stale-branch` in response to 10-min cron cycle. Confirmed: `claw doctor` on branch 5 commits behind main says "Status: ok" but `prompt` dispatch would warn "worktree HEAD does not match expected base commit." Gap is a missing invocation of the already-correct `run_stale_base_preflight()` in the `doctor` action handler. Joins **Boot preflight / doctor contract (#80–#83, #114)** family — doctor is the single machine-readable preflight surface; missing checks degrade operator trust. Also relates to **Silent-state inventory** cluster (#102/#127/#129/#245) because stale-base is a runtime truth ("my branch is behind main") that the preflight surface (doctor) does not expose.
+
+## Pinpoint #135. `claw status --json` missing `active_session` boolean and `session.id` cross-reference — two surfaces that should be unified are inconsistent
+
+**Gap.** `claw status --json` exposes a snapshot of the runtime state but does not include (1) a stable `session.id` field (filed as #134 — the fix from the other side is to emit it in lane events; the consumer side needs it queryable via `status` too) and (2) an `active_session: bool` that tells an orchestrator whether the runtime currently has a live session in flight. An external orchestrator (Clawhip, remote agent) running `claw status --json` after sending a prompt has no machine-readable way to confirm whether the session is alive, idle, or stalled without parsing log output.
+
+**Trace path.**
+- `claw status --json` (dispatcher in `main.rs` `CliAction::Status`) renders a `StatusReport` struct that includes `git_state`, `config`, `model`, `provider` — but no `session_id` or `active_session` fields.
+- `claw status` (text mode) also omits both.
+- The `session.id` fix from #134 introduces a UUID at session init; it should be threaded through to `StatusReport` so the round-trip is complete: emit on startup event → queryable via `status --json` → correlatable in lane events.
+
+**Fix shape (~30 lines).**
+1. Add `session_id: Option<String>` and `active_session: bool` to `StatusReport` struct. Both `null`/`false` when no session is active. When a session is running, `session_id` is the same UUID emitted in the startup lane event (#134).
+2. Thread the session state into the `status` handler via a shared `Arc<Mutex<SessionState>>` or equivalent (same mechanism #134 uses for startup event emission).
+3. Text-mode `claw status` surfaces the value: `Session: active (id: abc123)` or `Session: idle`.
+4. Regression tests: (a) `claw status --json` before any prompt → `active_session: false, session_id: null`. (b) `claw status --json` during a prompt session → `active_session: true, session_id: <uuid>`. (c) UUID matches the `session.id` in the first lane event of the same run.
+
+**Acceptance.** An orchestrator can poll `claw status --json` and determine: is there a live session? What is its correlation ID? Does it match the ID from the last startup event? This closes the round-trip opened by #134.
+
+**Blocker.** Depends on #134 (session.id generation at init). Can be filed and implemented together.
+
+**Source.** Jobdori dogfood 2026-04-21 06:53 KST on main HEAD `2c42f8b` during recurring cron cycle. Direct sibling of #134 — #134 covers the event-emission side, #135 covers the query side. Joins **Session identity completeness** (§4.7) and **status surface completeness** cluster (#80/#83/#114/#122). Natural bundle: **#134 + #135** closes the full session-identity round-trip. Session tally: ROADMAP #135.
+
+## Pinpoint #134. No run/correlation ID at session boundary — every observer must infer session identity from timing or prompt content
+
+   **Gap.** When a `claw` session starts, no stable correlation ID is emitted in the first structured event (or any event). Every observer — lane event consumer, log aggregator, Clawhip router, test harness — has to infer session identity from timing proximity or prompt content. If two sessions start in close succession there is no unambiguous way to attribute subsequent events to the correct session. `claw status --json` returns session metadata but does not expose an opaque stable ID that could be used as a correlation key across the event stream.
+
+   **Fix shape.**
+   - Emit `session.id` (opaque, stable, scoped to this boot) in the first structured event at startup
+   - Include same ID in all subsequent lane events as `session_id` field
+   - Expose via `claw status --json` so callers can retrieve the active session's ID from outside
+   - Add regression: golden-fixture asserting `session.id` is present in startup event and value matches across a multi-event trace
+
+   **Acceptance.** Any observer can correlate all events from a session using `session_id` without parsing prompt content or relying on timestamp proximity. `claw status --json` exposes the current session's ID.
+
+   **Blocker.** None. Requires a UUID/nanoid generated at session init and threaded through the event emitter.
+
+   **Source.** Jobdori dogfood 2026-04-21 01:54 KST on main HEAD `50e3fa3` during recurring cron cycle. Joins **Session identity completeness at creation time** (ROADMAP §4.7) — §4.7 covers identity fields at creation time; #134 covers the stable correlation handle that ties those fields to downstream events. Joins **Event provenance / environment labeling** (§4.6) — provenance requires a stable anchor; without `session.id` the provenance chain is broken at the root. Natural bundle with **#241** (no startup run/correlation id, filed by gaebal-gajae 2026-04-20) — #241 approached from the startup cluster; #134 approaches from the event-stream observer side. Same root fix closes both. Session tally: ROADMAP #134.
+
+## Pinpoint #136. `--compact` flag output is not machine-readable — compact turn emits plain text instead of JSON when `--output-format json` is also passed
+
+**Gap.** `claw --compact <prompt>` runs a prompt turn with compacted output (tool-use suppressed, final assistant text only). But `run_with_output()` routes on `(output_format, compact)` with an explicit early-return match: `CliOutputFormat::Text if compact => run_prompt_compact(input)`. The `CliOutputFormat::Json` branch is never reached when `--compact` is set. Result: passing `--compact --output-format json` silently produces plain-text output — the compact flag wins and the format flag is silently ignored. No warning or error is emitted.
+
+**Trace path.**
+- `rust/crates/rusty-claude-cli/src/main.rs:3872-3879` — `run_with_output()` match:
+  ```
+  CliOutputFormat::Text if compact => self.run_prompt_compact(input),
+  CliOutputFormat::Text => self.run_turn(input),
+  CliOutputFormat::Json => self.run_prompt_json(input),
+  ```
+  The `Json` arm is unreachable when `compact = true` because the first arm matches first regardless of `output_format`.
+- `run_prompt_compact()` at line 3879 calls `println!("{final_text}")` — always plain text, no JSON envelope.
+- `run_prompt_json()` at line 3891 wraps output in a JSON object with `message`, `model`, `iterations`, `usage`, `tool_uses`, `tool_results`, etc.
+
+**Fix shape (~20 lines).**
+1. Add a `CliOutputFormat::Json if compact` arm (or merge compact flag into `run_prompt_json` as a parameter) that produces a JSON object with `message: <final_text>` and a `compact: true` marker. Tool-use fields remain present but empty arrays (consistent with compact semantics — tools ran but are not returned verbatim).
+2. Emit a warning or `error.kind: "flag_conflict"` if conflicting flags are passed in a way that silently wins (or document the precedence explicitly in `--help`).
+3. Regression tests: `claw --compact --output-format json <prompt>` must produce valid JSON with at minimum `{message: "...", compact: true}`.
+
+**Acceptance.** An orchestrator that requests compact output for token efficiency AND machine-readable JSON gets both. Silent flag override is never a correct behavior for a tool targeting machine consumers.
+
+**Blocker.** None. Additive change to existing match arms.
+
+**Source.** Jobdori dogfood 2026-04-21 12:25 KST on main HEAD `8b52e77` during recurring cron cycle. Joins **Output format completeness** cluster (#90/#91/#92/#127/#130) — all surfaces that produce inconsistent or plain-text fallbacks when JSON is requested. Also joins **CLI/REPL parity** (§7.1) — compact is available as both `--compact` flag and `/compact` REPL command; JSON output gap affects only the flag path. Session tally: ROADMAP #136.
+
+## Pinpoint #138. Dogfood cycle report-gate opacity — nudge surface collapses "bundle converged", "follow-up landed", and "pre-existing flake only" into single closure shape
+
+**Gap.** When a dogfood nudge triggers on a branch with landed work, the report surface emits status like "fixed 3 tests, pushed branch, 1 unrelated red remains" — but downstream nudges cannot distinguish:
+1. `bundle converged, merge-ready` (e.g., #134/#135 branch after fixes)
+2. `follow-up landed on main, branch still valid` (e.g., #137 + #136 fixes after #134/#135 was ready)
+3. `only pre-existing flake remains, no new regressions` (e.g., `resume_latest...` test failure on main that also fails on feature branch)
+4. `work still in flight, blocker not yet resolved`
+5. `merged and closed, re-nudge is a dup`
+
+Result: repeat nudges look identical whether the prior work converged or is still broken. Claws re-open what was already resolved, burning cycles on rediscovery.
+
+**Concrete example from this session:**
+- 14:30 nudge triggered on bundle already clear (14:25)
+- Reported finding was "nudge closure-state opacity" but manifested as "should we re-nudge or not?"
+- No explicit surface like "status: done", "last-updated: 2026-04-21T14:25", "next-action: none" that stops re-nudges on unchanged state
+
+**Fix shape (~30-50 lines, surfaces not code).**
+1. Dogfood report should carry an explicit **closure state** field: `converged`, `follow-up-landed`, `pre-existing-flake-only`, `in-flight`, `merged`, `dup`.
+2. Each state has a **last-updated timestamp** (when report was filed) and **next-action** (null if converged, or describe blocker).
+3. Nudge logic checks prior report state: if `converged` + timestamp < 10 min old, skip nudge and post "still converged as of HH:MM, no action".
+4. If state changed (e.g., new commits landed), emit **state transition** explicitly: "bundle done (14:25) → follow-up landed (14:42)".
+5. Store closure state in a **shared metadata surface** (Discord message edit, ROADMAP inline, or compact JSON file) so next cycle can read it.
+
+**Acceptance.**
+- Repeat nudges on converged work are replaced with "no change since last report" (skip).
+- State transitions are explicit: "was X, now Y" instead of ambiguous "X and also Y".
+- Claws can scan closure states and prioritize fresh work over already-handled bundles.
+
+**Blocker.** Design question: **where should closure state live?** Options:
+- Edit the prior Discord message with a closure tag (e.g., 🟢 CONVERGED).
+- Add a `.dogfood-closure.json` file to the worktree branch that tracks state.
+- File a new ROADMAP entry per bundle completion (meta-tracking).
+- Embedded in claw-code CLI output (machine-readable, but creates coupling).
+
+Current state is **design question unresolved**. Implementation is straightforward once closure-state model is settled.
+
+**Source.** Jobdori dogfood 2026-04-21 14:25-14:47 KST — multi-cycle convergence pattern exposed by repeat nudges on #134/#135 bundle. Joins **Dogfood loop observability** (related to earlier §4.7 session-identity, but one level up — session-identity is plumbing, closure-state is the **reporting contract**). Also joins **False-green report gating** (from 14:05 finding) — this is the downstream effect: unclear reports beget re-nudges on stale work.
+
+Session tally: ROADMAP #138.
+
+### Evidence for #138 — feat/134-135-session-identity branch is pushed but no PR was opened (2026-04-21 15:05)
+
+**Concrete gap observed:**
+- Branch `feat/134-135-session-identity` pushed to `origin` at `7235260` (commits `f55612e`, `2b7095e`, `230d97a`, `7235260`)
+- Dogfood loop declared bundle "merge-ready" at 14:25
+- ~40 min elapsed; no PR opened, no merge, branch still unmerged
+- Meanwhile #136 and #137 landed directly on main (`a8beca1`, `21adae9`) without going through the branch
+
+**Direct verification of #135 on main:**
+- `env -i $BIN status --output-format json` on main HEAD `768c1ab` shows `active_session: null, session_id: null`
+- Fields exist in JSON schema (added by schema-only?) but values are None because the producer plumbing (`#134`) is not on main
+- #135 consumer relies on #134 producer; both live on feat/134-135 only
+
+**Impact:**
+- `claw status --output-format json` on main returns JSON without the #135 session identity signals (because they're only on feat/134-135)
+- Orchestrators that shipped using the 13:00 "round-trip proof" report believing #134+#135 was merge-ready will get null fields
+- Evidence for #138: "closure-state" = "pushed branch" ≠ "merged" ≠ "in-PR" — nudge surface collapses all three
+
+**Proposed closure-state transition:**
+1. `pushed` — branch exists on origin but no PR (current state for feat/134-135)
+2. `in-PR` — PR open, review pending
+3. `approved` — PR approved, awaiting merge
+4. `merged` — in main
+5. `deployed` — if applicable
+6. `abandoned` — PR closed without merge
+
+Nudge surface should report explicit state + timestamp: `"feat/134-135 state=pushed (no PR) since 13:00; no closure action taken"` instead of ambiguous "merge-ready."
+
+**Token/permission note:**
+- `code-yeongyu` token has write access to push branches to `ultraworkers/claw-code` but lacks `createPullRequest` permission (GraphQL 404)
+- Issues are disabled on the repo (can't open issue-based tracking)
+- Means closure-state tracking must live inside the repo (ROADMAP) or in an external surface (Discord message edits, `.dogfood-closure.json`)
+
+**Filed:** 2026-04-21 15:05 KST as evidence for #138 by Jobdori dogfood loop.
+
+## Pinpoint #139. `claw state` error message refers to "worker" concept that is not discoverable via `--help` or any documented command — error is unactionable for claws and CI
+
+**Gap.** `claw state` (both text and JSON output modes) returns this error when no worker-state.json exists:
+```
+error: no worker state file found at /private/tmp/cd-16/.claw/worker-state.json — run a worker first
+```
+
+**The problem:** "worker" is a concept that has **zero discoverability path** from the CLI surface:
+1. `claw --help` has no mention of workers, `claw worker`, or worker state
+2. There is no `claw worker` subcommand (not listed in help, not in the 16 known subcommands)
+3. No hint in the error itself about what command triggers worker state creation
+4. A claw, CI pipeline, or first-time user hitting this error has no actionable next step
+
+**Verified on main HEAD `f3f6643` (2026-04-21 15:58 KST):**
+```
+$ claw state --output-format json
+{"error":"no worker state file found at /private/tmp/cd-16/.claw/worker-state.json — run a worker first","type":"error"}
+```
+
+**Trace path.**
+- `rust/crates/rusty-claude-cli/src/main.rs` — `handle_state()` or equivalent returns this error when `.claw/worker-state.json` is missing.
+- No internal documentation on what produces `worker-state.json` (likely background worker session, but not surfaced)
+- `claw bootstrap-plan` mentions phases like `DaemonWorkerFastPath` and `BackgroundSessionFastPath` — suggesting workers are part of daemon/background execution — but this is internal architecture jargon, not user-facing
+
+**Why this is a clawability gap.**
+1. **Error references concept that is not discoverable.** Product Principle violation: "Errors must be actionable." Current error is descriptive but unactionable.
+2. **Claws can't self-heal.** A claw orchestrator that gets this error cannot construct a follow-up command because the remediation is not in the error or in `--help`.
+3. **Dogfood blocker.** Automated test setups that include `claw state` as a health check will fail silently for users who haven't triggered the worker path.
+4. **Internal architecture leaks into user surface.** The `worker` / `daemon` / `background session` distinction is internal runtime nomenclature, not user-facing workflow.
+
+**Fix shape (~20-40 lines).**
+1. **Error message should include remediation.** Change error to:
+   ```json
+   {
+     "error": "no worker state file found at <path> — run `claw` (interactive REPL) or `claw prompt <text>` to produce worker state",
+     "type": "error",
+     "hint": "Worker state is created when claw executes a prompt (REPL or one-shot). If you have run claw but still see this, check that your session wrote to .claw/worker-state.json.",
+     "next_action": "claw prompt \"hello\""
+   }
+   ```
+2. **Add `claw --help` reference.** Document under `Flags` or `Subcommand overview` that `claw state` requires prior execution.
+3. **Consistency with typed-error envelope** (ROADMAP §4.44): include `operation: "state-read"`, `target: "<path>"`, `retryable: false` fields for machine consumers.
+
+**Acceptance.**
+- `claw state` error text explicitly names the command(s) that produce worker state
+- `--help` has at least one line documenting the state/worker relationship
+- A claw reading the JSON error gets a structured `next_action` field
+
+**Blocker.** None. Pure error-text + doc fix. ~30 lines.
+
+**Source.** Jobdori dogfood 2026-04-21 16:00 KST on main HEAD `f3f6643`. Joins **error-message-quality** cluster (related to §4.44 typed error taxonomy and §5 failure class enumeration). Joins **CLI discoverability** cluster (#108 did-you-mean for typos, #127 --json on diagnostic verbs). Session tally: ROADMAP #139.
+
+## Pinpoint #141. `claw <subcommand> --help` has 5 different behaviors — inconsistent help surface breaks discoverability
+
+**Gap.** Running `<subcommand> --help` has five different behaviors depending on which subcommand you pick. This breaks the expected CLI contract that `<subcommand> --help` returns subcommand-specific help.
+
+**Matrix (verified on main HEAD `27ffd75` 2026-04-21 16:59 KST):**
+
+| Subcommand | Behavior | Status |
+|---|---|---|
+| `status`, `sandbox`, `doctor`, `skills`, `agents`, `mcp`, `acp` | Subcommand-specific help | ✅ correct |
+| `version` | Global `claw --help` | ⚠️ inconsistent |
+| `init`, `export`, `state` | Global `claw --help` | ⚠️ inconsistent |
+| `dump-manifests`, `system-prompt` | `error: unknown <cmd> option: --help` | ❌ broken |
+| `bootstrap-plan` | Prints phases JSON (not help at all) | ❌ broken |
+
+**Concrete repro:**
+```
+$ claw system-prompt --help
+error: unknown system-prompt option: --help
+
+$ claw dump-manifests --help
+error: unknown dump-manifests option: --help
+
+$ claw bootstrap-plan --help
+- CliEntry
+- FastPathVersion
+...
+
+$ claw init --help
+claw v0.1.0
+Usage:
+  claw [--model MODEL] ...    # this is global help, not init-specific
+```
+
+**Why this is a clawability gap.**
+1. **Product principle violation**: every CLI subcommand should have a consistent `<cmd> --help` contract that returns subcommand-specific help.
+2. **CI/orchestration hazard**: a claw script that tries `<cmd> --help | grep <option>` gets structural behavior differences — some return 0, some return 1 with "unknown option", some return global help that doesn't mention the subcommand at all.
+3. **Discoverability asymmetry**: 7 subcommands have good help, 4 have global-help fallback, 2 error out, 1 produces irrelevant output. No documented reason for the split.
+4. **Follow-on from #108**: #108 fixed subcommand typos at the dispatch layer. #141 is the next layer up — even valid subcommands have inconsistent `--help` dispatch.
+
+**Fix shape (~50 lines).**
+1. For subcommands that return a structured help block (`status`, `sandbox`, `doctor`, `skills`, `agents`, `mcp`, `acp`): this is the model. Use the same pattern.
+2. For `init`, `export`, `state`, `version`: add subcommand-specific help block or explicitly dispatch `--help` to `claw --help` (consistent fallback is OK; returning global help that doesn't mention the subcommand is not).
+3. For `dump-manifests`, `system-prompt`: fix the parser to recognize `--help` as a dispatch rather than unknown flag. Add subcommand-specific help.
+4. For `bootstrap-plan`: add `--help` dispatch to explain what the subcommand does (currently prints phases, which is the primary output but not help text).
+5. Add a consistency test: `for cmd in <list>: assert exitcode_of("claw $cmd --help") == 0 and contains help text`.
+
+**Acceptance.**
+- All 14 subcommands have `<cmd> --help` exit 0 with relevant help text
+- No "unknown option" errors from `<cmd> --help`
+- Consistency test in the regression suite
+
+**Blocker.** None. Scoped to CLI parser + help text. ~50 lines + test.
+
+**Source.** Jobdori dogfood 2026-04-21 16:59 KST on main HEAD `27ffd75`. Joins **CLI/REPL parity** cluster (§7.1) and **discoverability** cluster (#108 did-you-mean, #127 --json on diagnostic verbs, #139 worker concept unactionable). Session tally: ROADMAP #141.
+
+## Pinpoint #142. `claw init --output-format json` dumps human text into `message` — no structured fields for created/skipped files
+
+**Gap.** `claw init --output-format json` emits a valid JSON envelope, but the payload is entirely a human-formatted multi-line text block packed into `message`. There are no structured fields to tell a claw script which files were created, which were skipped, or what the project path was.
+
+**Verified on main HEAD `21b377d` 2026-04-21 17:34 KST.**
+
+**Actual output (fresh directory, everything created):**
+```json
+{
+  "kind": "init",
+  "message": "Init\n  Project          /private/tmp/cd-1730b\n  .claw/           created\n  .claw.json       created\n  .gitignore       created\n  CLAUDE.md        created\n  Next step        Review and tailor the generated guidance"
+}
+```
+
+**Idempotent second call (everything skipped):**
+```json
+{
+  "kind": "init",
+  "message": "Init\n  Project          /private/tmp/cd-1730b\n  .claw/           skipped (already exists)\n  .claw.json       skipped (already exists)\n  .gitignore       skipped (already exists)\n  CLAUDE.md        skipped (already exists)\n  Next step        Review and tailor the generated guidance"
+}
+```
+
+**Compare `claw status --output-format json` (the model):**
+```json
+{
+  "kind": "status",
+  "model": "claude-opus-4-6",
+  "permission_mode": "danger-full-access",
+  "sandbox": { "active": false, "enabled": true, "fallback_reason": "...", ... },
+  "usage": { "cumulative_input": 0, "messages": 0, "turns": 0, ... },
+  "workspace": { "changed_files": 0, ... }
+}
+```
+
+**Why this is a clawability gap.**
+1. **Substring matching required**: to tell whether `.claw/` was created vs skipped, a claw has to grep the `message` string for `"created"` or `"skipped (already exists)"`. Not a contract — human-language fragility.
+2. **No programmatic idempotency signal**: CI/orchestration cannot easily tell "first run produced new files" from "second run was no-op". Both paths end up with `kind: init` and a free-form message.
+3. **Inconsistent with `status`/`sandbox`/`doctor`**: those subcommands have first-class structured JSON. `init` does not. Product contract asymmetry.
+4. **Path isn't a field**: the project path is embedded in the same string. No `project_path` key.
+5. **Joins JSON-output cluster** (#90, #91, #92, #127, #130, #136): every one of those was a JSON contract shortfall where the command technically emitted JSON but did not emit *useful* JSON.
+
+**Fix shape (~40 lines).**
+Add structured fields alongside `message` (keep `message` for backward compat):
+```json
+{
+  "kind": "init",
+  "project_path": "/private/tmp/cd-1730b",
+  "created": [".claw", ".claw.json", ".gitignore", "CLAUDE.md"],
+  "skipped": [],
+  "next_step": "Review and tailor the generated guidance",
+  "message": "Init\n  Project..."
+}
+```
+
+On idempotent call: `created: []`, `skipped: [".claw", ".claw.json", ...]`.
+
+**Acceptance.**
+- `claw init --output-format json` has `created`, `skipped`, `project_path`, `next_step` top-level fields
+- `created.len() + skipped.len() == 4` on standard init
+- Idempotent call has empty `created`
+- Existing `message` field preserved for text consumers (deprecation path only if needed)
+- Regression test: JSON schema assertions for both fresh + idempotent cases
+
+**Blocker.** None. Scoped to `init` subcommand JSON serializer. ~40 lines.
+
+**Source.** Jobdori dogfood 2026-04-21 17:34 KST on main HEAD `21b377d`. Joins **JSON output completeness** cluster (#90/#91/#92/#127/#130/#136). Session tally: ROADMAP #142.
+
+## Pinpoint #143. `claw status` hard-fails on malformed MCP config; `claw doctor` degrades gracefully — inconsistent contract around partial config breakage
+
+**Gap.** Running `claw status` against a workspace with a malformed `.claw.json` (e.g., one `mcpServers.*` entry missing the required `command` field) crashes out at parse time with a terse error, even when the rest of the config is valid and most status fields could still be reported. `claw doctor` handles the exact same file correctly, embedding the parse error inside the typed envelope as `status: "fail"` on the `config` check while still reporting `auth`, `install source`, `workspace`, etc.
+
+This is both an inconsistency (two diagnostic surfaces behave differently on identical input) and a violation of Product Principle #5 (*Partial success is first-class*).
+
+**Verified on main HEAD `e73b6a2` (2026-04-21 18:30 KST):**
+
+Given a `.claw.json` with one valid server and one malformed entry:
+```json
+{
+  "mcpServers": {
+    "everything": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-everything"] },
+    "missing-command": { "args": ["arg-only-no-command"] }
+  }
+}
+```
+
+`claw status` (both text and JSON modes):
+```
+$ claw status
+error: /Users/.../.claw.json: mcpServers.missing-command: missing string field command
+Run `claw --help` for usage.
+
+$ claw status --output-format json
+{"error":"/Users/.../.claw.json: mcpServers.missing-command: missing string field command","type":"error"}
+```
+
+`claw doctor --output-format json` on the *same* file:
+```json
+{
+  "checks": [
+    {"name":"auth", "status":"warn", ...},
+    {
+      "name":"config",
+      "status":"fail",
+      "load_error":"/Users/.../.claw.json: mcpServers.missing-command: missing string field command",
+      "discovered_files":["..."],
+      "discovered_files_count":5,
+      "summary":"runtime config failed to load: ..."
+    },
+    {"name":"install_source", "status":"ok", ...},
+    ...
+  ]
+}
+```
+
+Doctor keeps going and produces a full typed report. Status refuses to produce any fields at all.
+
+**Why this is a clawability gap.**
+1. **Two surfaces, one config, two behaviors.** A claw cannot rely on a stable contract: `doctor` treats malformed MCP as a classifiable condition; `status` treats it as a fatal parse error. Same input, opposite response.
+2. **Partial-success violation (Principle #5).** The malformed field is scoped to one MCP server entry. Workspace state, current model, permission mode, session info, and git state are all independently resolvable and would be useful to report even when one MCP server entry is unparseable. A claw debugging a misconfig needs to see which fields *do* work.
+3. **No per-field error surface.** Even the bare error string lacks structure (`mcpServers.missing-command: missing string field command` is a parse trace, not a typed error object). No `error_kind`, no `retryable`, no `affected_field`, no `hint`. Claws can't route on this.
+4. **Clawhip health checks.** Clawhip uses `claw status --output-format json` as a liveness probe on managed lanes. A single broken MCP entry takes down the probe entirely, not just the MCP subsystem, making "is the workspace usable?" impossible to answer without also running `doctor`.
+5. **Onboarding friction.** A user who copy-pastes an MCP config and mistypes one field discovers this only when `status` stops working. Doctor tells them what's wrong; status does not. First-run users are more likely to reach for `status`.
+
+**Fix shape (~60-100 lines, two-phase).**
+
+**Phase 1 (immediate, small):** Make `claw status` degrade gracefully like `doctor` does. When config load fails:
+- Report `config_load_error` as a first-class field with the parse-error string.
+- Still report what can be resolved without config: effective model (from env + CLI args), permission mode, sandbox posture, git state, workspace metadata.
+- Set top-level `status: "degraded"` in the envelope so claws can distinguish "status ran but config is broken" from "status ran cleanly".
+- Keep the existing error text as a `config_load_error` string for humans, but do not abort.
+
+**Phase 2 (medium, joins typed-error taxonomy #4.44):** Typed error object for config-parse failures:
+```json
+"config_load_error": {
+  "kind": "config_parse",
+  "retryable": false,
+  "file": "/Users/.../.claw.json",
+  "field_path": "mcpServers.missing-command",
+  "message": "missing string field command",
+  "hint": "each mcpServers entry requires a `command` string; see USAGE.md#mcp"
+}
+```
+
+**Acceptance.**
+- `claw status` on a workspace with one malformed MCP entry returns exit code 0 with a top-level `status: "degraded"` (or equivalent typed marker) and populated workspace/git/model/permission fields.
+- The malformed MCP error surfaces as a structured `config_load_error` field, not as a bare string at the envelope root.
+- `claw status --output-format json` contract matches `claw doctor --output-format json` on the same input: both must report the config parse error, neither may hard-fail.
+- Regression test: inject malformed MCP config, assert `status` returns 0 with degraded marker and `config_load_error.field_path == "mcpServers.missing-command"`.
+
+**Blocker.** None for Phase 1. Phase 2 depends on the typed-error taxonomy landing (ROADMAP §4.44), but Phase 1 can ship independently and be tightened later.
+
+**Source.** Jobdori dogfood 2026-04-21 18:30 KST on main HEAD `e73b6a2`, surfaced by running `claw status` in `/Users/yeongyu/clawd` which contains a `.claw.json` with deliberately broken MCP entries. Joins **partial-success / degraded-mode** cluster (Principle #5, Phase 6) and **surface consistency** cluster (#141 help-contract unification, #108 typo guard). Session tally: ROADMAP #143.
+
+## Pinpoint #144. `claw mcp` hard-fails on malformed MCP config — same surface inconsistency as #143, one command over
+
+**Gap.** With `claw status` fixed in #143 Phase 1, `claw mcp` is now the remaining diagnostic surface that hard-fails on a malformed `.claw.json`. Same input, same parse error, same partial-success violation.
+
+**Verified on main HEAD `e2a43fc` (2026-04-21 18:59 KST):**
+
+Same `.claw.json` used for #143 repro (one valid `everything` server + one malformed `missing-command` entry).
+
+`claw mcp`:
+```
+error: /Users/.../.claw.json: mcpServers.missing-command: missing string field command
+Run `claw --help` for usage.
+```
+Exit 1. No list. The well-formed `everything` server is invisible.
+
+`claw mcp --output-format json`:
+```json
+{"error":"/Users/.../.claw.json: mcpServers.missing-command: missing string field command","type":"error"}
+```
+Exit 1. Same story.
+
+`claw status --output-format json` on the same file (post-#143):
+```json
+{"kind":"status","status":"degraded","config_load_error":"...","workspace":{...},"sandbox":{...},...}
+```
+Exit 0. Full envelope with error surfaced.
+
+**Why this is a clawability gap (same family as #143).**
+1. **Principle #5 violation**: partial success is first-class. One malformed entry shouldn't make the entire MCP subsystem invisible.
+2. **Surface inconsistency (cluster of 3)**: after #143 Phase 1, the behavior matrix is:
+   - `doctor` — degraded envelope ✅
+   - `status` — degraded envelope ✅ (#143)
+   - `mcp` — hard-fail ❌ (this pinpoint)
+3. **Clawhip impact**: `claw mcp --output-format json` is used by orchestrators to detect which MCP servers are available before invoking tools. A broken probe forces clawhip to fall back to doctor parse, which is suboptimal.
+
+**Fix shape (~40 lines, mirrors #143 Phase 1).**
+1. Make `render_mcp_report_json_for()` and `render_mcp_report_for()` catch the `ConfigError` at `loader.load()?`.
+2. On parse failure, emit a degraded envelope:
+   ```json
+   {
+     "kind": "mcp",
+     "action": "list",
+     "status": "degraded",
+     "config_load_error": "...",
+     "working_directory": "...",
+     "configured_servers": 0,
+     "servers": []
+   }
+   ```
+3. Text mode: prepend a "Config load error" block (same shape as #143) before the "MCP" block.
+4. Exit 0 so downstream probes don't treat a parse error as process death.
+
+**Acceptance.**
+- `claw mcp` and `claw mcp --output-format json` on a workspace with malformed config exit 0.
+- JSON mode includes `status: "degraded"` and `config_load_error` field.
+- Text mode shows the parse error in a separate block, not as the only output.
+- Clean path (no config errors) still returns `status: "ok"` (or equivalent — align with #143 serializer).
+- Regression test: inject malformed config, assert mcp returns degraded envelope.
+
+**Blocker.** None. Mirrors #143 Phase 1 shape exactly.
+
+**Future phase (joins #143 Phase 2).** When typed-error taxonomy lands (§4.44), promote `config_load_error` from string to typed object across `doctor`, `status`, and `mcp` in one pass.
+
+**Source.** Jobdori dogfood 2026-04-21 18:59 KST on main HEAD `e2a43fc`. Joins **partial-success** cluster (#143, Principle #5) and **surface consistency** cluster. Session tally: ROADMAP #144.
+
+## Pinpoint #145. `claw plugins` subcommand not wired to CLI parser — word gets treated as a prompt, hits Anthropic API
+
+**Gap.** `claw plugins` (and `claw plugins list`, `claw plugins --help`, `claw plugins info <name>`, etc.) fall through the top-level subcommand match and get routed into the prompt-execution path. Result: a purely local introspection command triggers an Anthropic API call and surfaces `missing Anthropic credentials` to the user. With valid credentials, it would actually send the string `"plugins"` as a prompt to Claude, burning tokens for a local query.
+
+**Verified on main HEAD `faeaa1d` (2026-04-21 19:32 KST):**
+
+```
+$ claw plugins
+error: missing Anthropic credentials; export ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY before calling the Anthropic API
+
+$ claw plugins --output-format json
+{"error":"missing Anthropic credentials; ...","type":"error"}
+
+$ claw plugins --help
+error: missing Anthropic credentials; ...
+
+$ claw plugins list
+error: missing Anthropic credentials; ...
+
+$ ANTHROPIC_API_KEY=dummy claw plugins
+⠋ 🦀 Thinking...
+✘ ❌ Request failed
+error: api returned 401 Unauthorized (authentication_error)
+```
+
+Compare `agents`, `mcp`, `skills` — all recognized, all local, all exit 0:
+
+```
+$ claw agents
+No agents found.
+$ claw mcp
+MCP
+  Working directory ...
+  Configured servers 0
+```
+
+**Root cause.** In `rusty-claude-cli/src/main.rs`, the top-level `match rest[0].as_str()` parser has arms for `agents`, `mcp`, `skills`, `status`, `doctor`, `init`, `export`, `prompt`, etc., but **no arm for `plugins`**. The `CliAction::Plugins` variant exists, has a dispatcher (`print_plugins`), and is produced by `SlashCommand::Plugins` inside the REPL — but the top-level CLI path was never wired. Result: `plugins` matches neither a known subcommand nor a slash path, so it falls through to the default "run as prompt" behavior.
+
+**Why this is a clawability gap.**
+1. **Prompt misdelivery (explicit Clawhip category)**: the command string is sent to the LLM instead of dispatched locally. Real risk: without the credentials guard, `claw plugins` would send `"plugins"` as a user prompt to Claude, burning tokens.
+2. **Surface asymmetry**: `plugins` is the only diagnostic-adjacent command that isn't wired. Documentation, slash command, and dispatcher all exist; parser wiring was missed.
+3. **`--help` should never hit the network**. Anywhere.
+4. **Misleading error**: user running `claw plugins` sees an Anthropic credential error. No hint that `plugins` wasn't a recognized subcommand.
+
+**Fix shape (~20 lines).** Add a `"plugins"` arm to the top-level parser in `main.rs` that produces `CliAction::Plugins { action, target, output_format }`, following the same positional convention as `mcp` (`action` = first positional, `target` = second). The existing `CliAction::Plugins` handler (`LiveCli::print_plugins`) already covers text and JSON.
+
+**Acceptance.**
+- `claw plugins` exits 0 with plugins list (empty in a clean workspace, which is the honest state).
+- `claw plugins --output-format json` emits `{"kind":"plugin","action":"list",...}` with exit 0.
+- `claw plugins list` exits 0 and matches `claw plugins`.
+- `claw plugins info <name>` resolves through the existing handler.
+- No Anthropic network call occurs for any `plugins` invocation.
+- Regression test: parse `["claw", "plugins"]`, assert `CliAction::Plugins { action: None, target: None, .. }`.
+
+**Blocker.** None. `CliAction::Plugins` already exists with a working dispatcher.
+
+**Source.** Jobdori dogfood 2026-04-21 19:30 KST on main HEAD `faeaa1d` in response to Clawhip nudge. Joins **prompt misdelivery** cluster. Session tally: ROADMAP #145.
+
+## Pinpoint #146. `claw config` and `claw diff` are pure-local introspection commands but require `--resume SESSION.jsonl` wrapping
+
+**Gap.** Running `claw config` or `claw diff` directly exits with an error pointing to `claw --resume SESSION.jsonl /config` as the only path. Both commands are pure, read-only introspection: `config` reads files from disk and merges them; `diff` shells out to `git diff --cached` + `git diff`. Neither needs a session context to produce correct output.
+
+**Verified on main HEAD `7d63699` (2026-04-21 20:03 KST):**
+
+```
+$ claw config
+error: `claw config` is a slash command. Use `claw --resume SESSION.jsonl /config` or start `claw` and run `/config`.
+
+$ claw config --output-format json
+{"error":"`claw config` is a slash command. ...","type":"error"}
+
+$ claw diff
+error: `claw diff` is a slash command. Use `claw --resume SESSION.jsonl /diff` or start `claw` and run `/diff`.
+```
+
+Meanwhile `agents`, `mcp`, `skills`, `status`, `doctor`, `sandbox`, `plugins` (after #145) all work standalone.
+
+**Why this is a clawability gap.**
+1. **Synthetic friction**: requires a session file to inspect static disk state. A claw probing configuration has to spin up a session it doesn't need.
+2. **Surface asymmetry**: all other read-only diagnostics are standalone. `config` and `diff` are the remaining holdouts.
+3. **Pipeline-unfriendly**: `claw config --output-format json | jq` and `claw diff | less` are natural operator workflows; both are currently broken.
+4. **Both already have working JSON renderers** (`render_config_json`, `render_diff_json_for`) — infrastructure for top-level wiring exists.
+
+**Fix shape (~30 lines).** Add `"config"` and `"diff"` arms to the top-level parser in `main.rs` (mirroring #145's `plugins` wiring). Each dispatches to a new `CliAction` variant or to existing resume-supported renderers directly. Text mode uses `render_config_report` / `render_diff_report`; JSON mode uses `render_config_json` / `render_diff_json_for`. Remove `config` from `bare_slash_command_guidance`'s fallback allowlist only if explicitly gating (parser arm already short-circuits).
+
+**Acceptance.**
+- `claw config` exits 0 with discovered-file listing + merged-keys count.
+- `claw config --output-format json` emits typed envelope with discovered files and merged JSON.
+- `claw config env` / `claw config plugins` surface specific sections (matches `SlashCommand::Config { section }` semantics).
+- `claw diff` exits 0 with clean-tree message or staged/unstaged summary.
+- `claw diff --output-format json` emits typed envelope.
+- Regression tests: `parse_args(["config"])` → `CliAction::Config`; `parse_args(["diff"])` → `CliAction::Diff`.
+
+**Blocker.** None. Renderers exist and are resume-supported (proving they're pure-local).
+
+**Not applying to.** `hooks` (session-state-modifying, explicitly flagged "unsupported resumed slash command" in main.rs), `usage`, `context`, `tasks`, `theme`, `voice`, `rename`, `copy`, `color`, `effort`, `branch`, `rewind`, `ide`, `tag`, `output-style`, `add-dir` — all session-mutating or interactive-only.
+
+**Source.** Jobdori dogfood 2026-04-21 20:03 KST on main HEAD `7d63699` in response to Clawhip nudge. Joins **surface asymmetry** cluster (#145 sibling). Session tally: ROADMAP #146.
+
+## Pinpoint #147. `claw ""` / `claw "   "` silently fall through to prompt-execution path; empty-prompt guard is subcommand-only
+
+**Gap.** The explicit `claw prompt ""` path rejects empty/whitespace-only prompts with a clear error (`prompt subcommand requires a prompt string`, exit 1, no network call). The implicit fallthrough path — where any unrecognized first positional arg is treated as a prompt — has no such guard. Result: `claw ""`, `claw "   "`, and `claw "" ""` all get routed to the Anthropic call with an empty prompt string, which surfaces the misleading `missing Anthropic credentials` error.
+
+**Verified on main HEAD `f877aca` (2026-04-21 20:32 KST):**
+
+```
+$ claw prompt ""
+error: prompt subcommand requires a prompt string
+
+$ claw ""
+error: missing Anthropic credentials; export ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY ...
+
+$ claw "   "
+error: missing Anthropic credentials; ...
+
+$ claw "" ""
+error: missing Anthropic credentials; ...
+
+$ claw --output-format json ""
+{"error":"missing Anthropic credentials; ...","type":"error"}
+```
+
+With valid credentials, the empty string would be sent to Claude as a user prompt — burning tokens for nothing, or getting a model-side refusal for empty input.
+
+**Why this is a clawability gap.**
+1. **Inconsistent guard**: the `"prompt"` subcommand arm enforces `if prompt.trim().is_empty() { Err(...) }`, but the fallthrough `other` arm in the same match block does not. Same contract should apply to both paths.
+2. **Prompt misdelivery (Clawhip category)**: same root pattern as #145 (wrong thing gets treated as a prompt). Different manifestation — here it's an empty string, not a typo'd subcommand.
+3. **Misleading error surface**: user sees `missing Anthropic credentials` for a request that should never have reached the API layer at all.
+4. **Clawhip risk**: a misconfigured orchestrator passing `""` or `"   "` as a positional arg ends up paying API costs for empty prompts instead of getting fast feedback.
+
+**Fix shape (~5 lines).** In `parse_subcommand()`'s fallthrough `other` arm, add the same trim-based empty check already used in the `"prompt"` arm, with a message that distinguishes it from the `prompt` subcommand path (e.g. `"empty prompt: provide a command or non-empty prompt text"`). Happens before `looks_like_subcommand_typo` since typos aren't empty.
+
+**Acceptance.**
+- `claw ""` exits 1 with a clear "empty prompt" error, no credential check.
+- `claw "   "` exits 1 with the same error.
+- `claw "" ""` exits 1 with the same error.
+- `claw --output-format json ""` emits the error in typed envelope, exit 1.
+- `claw hello` still reaches the typo guard (#108), not the empty guard.
+- `claw prompt ""` still emits its own specific error.
+- Regression test: `parse_args([""])` → Err, `parse_args(["   "])` → Err.
+
+**Blocker.** None. 5-line change in `parse_subcommand()`.
+
+**Source.** Jobdori dogfood 2026-04-21 20:32 KST on main HEAD `f877aca` in response to Clawhip nudge. Joins **prompt misdelivery** cluster (#145 sibling). Session tally: ROADMAP #147.
+
+## Pinpoint #148. `claw status` JSON shows resolved model but not raw input or source — post-hoc "why did my --model flag behave this way?" requires re-reading argv
+
+**Gap.** After #128 closed (malformed model strings now rejected at parse time), the residual provenance gap from the original #124 pinpoint remains: `claw status --output-format json` surfaces only the resolved model string. No trace of whether the user passed `--model sonnet` (alias → resolved), `--model anthropic/claude-opus-4-6` (pass-through), or relied on env/config default. A claw debugging "which model actually runs if I invoke this?" has to inspect argv instead of reading a structured field.
+
+**Verified on main HEAD `4cb8fa0` (2026-04-21 20:40 KST):**
+
+```
+$ claw --model sonnet --output-format json status | jq '{model}'
+{"model": "claude-sonnet-4-6"}
+
+$ claw --model anthropic/claude-opus-4-6 --output-format json status | jq '{model}'
+{"model": "anthropic/claude-opus-4-6"}
+
+# Same resolved value can come from three different sources;
+# JSON envelope gives no way to distinguish.
+```
+
+**Why this is a clawability gap.**
+1. **Loss of origin information**: alias resolution collapses `sonnet` and `claude-sonnet-4-6` and `{"aliases":{"x":"claude-sonnet-4-6"}}` + `--model x` into one string. Debug forensics has to read argv.
+2. **Clawhip orchestration**: a clawhip dispatcher sending `--model` wants to confirm its flag was honored, not that the default kicked in (#105 model-resolution-source disagreement is adjacent).
+3. **Truth-audit / diagnostic-integrity**: the status envelope is supposed to be the single source of truth for "what would this process run as". Missing provenance weakens the contract.
+
+**Fix shape (~50 lines).** Add two fields to status JSON:
+- `model_source`: `"flag" | "env" | "config" | "default"` — where the model string came from.
+- `model_raw`: the user's original input (pre-alias-resolution). Null when source is `default`.
+
+Text mode appends a line: `Model source     flag (raw: sonnet)` or `Model source     default`.
+
+Threading: parser already knows the source (it's the arm that sets `model`). Propagate `(model, model_raw, model_source)` tuple through `CliAction::Status` and into `StatusContext`. Env/default resolution paths are in `resolve_repl_model*` helpers.
+
+**Acceptance.**
+- `claw --model sonnet --output-format json status` → `model: "claude-sonnet-4-6"`, `model_raw: "sonnet"`, `model_source: "flag"`.
+- `claw --model anthropic/claude-opus-4-6 --output-format json status` → `model_raw: "anthropic/claude-opus-4-6"`, `model_source: "flag"`.
+- `claw --output-format json status` (no flag) → `model_raw: null`, `model_source: "default"` (or `"env"` if `ANTHROPIC_MODEL` set; or `"config"` if `.claw.json` set `model`).
+- Text mode shows same provenance.
+- Regression test: parse_args + status_json_value roundtrip asserts each source value.
+
+**Blocker.** None. All resolution sites already exist; only plumbing + one serialization addition.
+
+**Not a regression of #128.** #128 was about rejecting malformed strings (now closed). #148 is about labeling the valid ones after resolution.
+
+**Source.** Jobdori dogfood 2026-04-21 20:40 KST on main HEAD `4cb8fa0` in response to Q's bundle hint. Split from historical #124 residual. Joins **truth-audit / diagnostic-integrity** cluster. Session tally: ROADMAP #148.
+
+## Pinpoint #149. `runtime::config::tests::validates_unknown_top_level_keys_with_line_and_field_name` flakes under parallel workspace test runs
+
+**Gap.** When `cargo test --workspace` runs with normal parallel test execution (default), `runtime::config::tests::validates_unknown_top_level_keys_with_line_and_field_name` intermittently fails. In isolation (`cargo test -p runtime validates_unknown_top_level_keys_with_line_and_field_name`), it passes deterministically. The same pattern affects other tests in `runtime/src/config.rs` and sibling test modules that share the `temp_dir()` naming strategy.
+
+**Verified on main HEAD `f84c7c4` (2026-04-21 20:50 KST):** witnessed during `cargo test --workspace` runs for #147 and #148 — one workspace run produced:
+
+```
+test config::tests::validates_unknown_top_level_keys_with_line_and_field_name ... FAILED
+test result: FAILED. 464 passed; 1 failed; 0 ignored; 0 measured
+```
+
+Same test passed on the next workspace run. Same test passes in isolation every time.
+
+**Root cause.** `runtime/src/config.rs` tests share this helper:
+
+```rust
+fn temp_dir() -> std::path::PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be after epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!("runtime-config-{nanos}"))
+}
+```
+
+Two weaknesses:
+1. **Timestamp-only namespacing**: on fast machines with coarse-grained clocks (or with tests starting within the same nanosecond bucket), two tests pick the same path. One races `fs::create_dir_all()` with another's `fs::remove_dir_all()`.
+2. **No label differentiation**: every test in the file calls `temp_dir()` and constructs sub-paths inside the shared prefix. A `fs::remove_dir_all(root)` in one test's cleanup may clobber a live sibling.
+
+Other crates in the workspace (`plugins::tests::temp_dir`, `runtime::git_context::tests::temp_dir`) already use the **labeled** form `temp_dir(label)` to segregate namespaces per-test. `runtime/src/config.rs` was missed in that sweep.
+
+**Fix shape (~30 lines).** Convert `temp_dir()` in `runtime/src/config.rs` to `temp_dir(label: &str)` mirroring the plugins/git_context pattern, plus add a PID + atomic counter suffix for double-strength collision resistance:
+
+```rust
+fn temp_dir(label: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).expect("...").as_nanos();
+    let pid = std::process::id();
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("runtime-config-{label}-{pid}-{nanos}-{seq}"))
+}
+```
+
+Update each `temp_dir()` callsite in the file to pass a unique label (test function name usually works).
+
+**Acceptance.**
+- `cargo test --workspace` 10x consecutive runs all green (excluding pre-existing `resume_latest` flake which is orthogonal).
+- `cargo test -p runtime` 10x consecutive runs all green.
+- Cleanup `fs::remove_dir_all(root)` never races because `root` is guaranteed unique per-test.
+- No behavior change for tests already passing in isolation.
+
+**Blocker.** None. Mechanical rename + label addition.
+
+**Not applying to.** `plugins::tests::temp_dir` and `runtime::git_context::tests::temp_dir` already use the labeled form. The label pattern is the established workspace convention; this just applies it to the one holdout.
+
+**Source.** Jobdori dogfood 2026-04-21 20:50 KST, flagged during #147 and #148 workspace-test runs. Joins **test brittleness / flake** cluster. Session tally: ROADMAP #149.
+
+## Pinpoint #150. `resume_latest_restores_the_most_recent_managed_session` flakes due to symlink/canonicalization mismatch
+
+**Gap.** Test `resume_latest_restores_the_most_recent_managed_session` in `rusty-claude-cli/tests/resume_slash_commands.rs` intermittently fails when run as part of the workspace suite or in parallel.
+
+**Root cause.** `workspace_fingerprint(path)` hashes the workspace path string directly without canonicalization. On macOS, `/tmp` is a symlink to `/private/tmp`. The test creates a temp dir via `std::env::temp_dir().join(...)` which may return `/var/folders/...` (non-canonical). The test uses this non-canonical path to create sessions. When the subprocess spawns, `env::current_dir()` returns the canonical path `/private/var/folders/...`. The two fingerprints differ, so the subprocess looks in `.claw/sessions/<hash1>` while files are in `.claw/sessions/<hash2>`. Session discovery fails.
+
+**Verified on main HEAD `bc259ec` (2026-04-21 21:00 KST):** Test failed intermittently during workspace runs and consistently failed when run 5x in sequence before the fix.
+
+**Fix shape (~5 lines).** Call `fs::canonicalize(&project_dir)` after creating the directory but before passing it to `SessionStore::from_cwd()`. This ensures the test and subprocess use identical path representations when computing the fingerprint.
+
+```rust
+fs::create_dir_all(&project_dir).expect("project dir should exist");
+let project_dir = fs::canonicalize(&project_dir).unwrap_or(project_dir);
+let store = runtime::SessionStore::from_cwd(&project_dir).expect(...);
+```
+
+**Acceptance.**
+- `cargo test -p rusty-claude-cli --test resume_slash_commands` passes.
+- 5 consecutive runs all green (previously: 5/5 failed).
+- No behavior change; test now correctly isolates temp paths.
+
+**Blocker.** None.
+
+**Note.** This is the last known pre-existing test flake in the workspace. `resume_latest` was the only survivor from earlier sessions.
+
+**Source.** Jobdori dogfood 2026-04-21 21:00 KST, Q's "clean up remaining flake" hint led to root-cause analysis and fix. Session tally: ROADMAP #150.
+
+## Pinpoint #246. Reminder cron outcome ambiguity — no structured feedback on nudge delivery/skip/timeout
+
+**Gap (control-loop blocker).** The `clawcode-dogfood-cycle-reminder` cron triggers dogfood cycles every 10 minutes. When it times out (witnessed multiple times during 2026-04-21 sweep), there is no structured answer to: Was the nudge delivered? Did it fail before send? After send? Was it skipped due to an active cycle? Did the gateway drain and abort?
+
+**Impact.** Repeated timeouts produce scheduler fog instead of trustworthy dogfood pressure. Team cannot distinguish:
+- Silent delivery (nudge went out, cycle ran)
+- Delivery followed by subprocess crash (nudge reached Discord, but cycle had issues)
+- Timeout before send (cron died early)
+- Timeout after send (cron sent nudge, died before cleanup)
+- Deduplication (active cycle still running, nudge skipped)
+- Gateway draining (request in-flight when daemon shutdown)
+
+**Phase 1 spec (outcome schema).** Extend cron task results to include a `reminder_outcome` field with explicit values:
+- `"delivered"` — nudge successfully posted to Discord; next cycle can proceed
+- `"timed_out_before_send"` — cron died before posting; retry on next interval
+- `"timed_out_after_send"` — nudge posted (or should assume posted), but cleanup/logging timed out
+- `"skipped_due_to_active_cycle"` — previous cycle still running; no nudge issued
+- `"aborted_gateway_draining"` — reminding stopped because o p e n c l a w gateway is draining
+
+Deliverable: Update `clawcode-dogfood-cycle-reminder` task to emit this field on completion/timeout/skip.
+
+**Phase 2 (observability).** Log all five outcomes to Agentika and surface via `clawhip status` or similar monitoring surface so Q/gaebal-gajae can see nudge history.
+
+**Blocker.** Assigned to gaebal-gajae's domain (cron scheduling / o p e n c l a w orchestration). Not a claw-code CLI blocker; purely infrastructure/monitoring.
+
+**Source.** Q's direct observation during 2026-04-21 20:50–21:00 dogfood cycles: repeated timeouts with no way to diagnose. Session tally: ROADMAP #246.
+
+## Pinpoint #151. `workspace_fingerprint` path-equivalence contract gap (product, not just test)
+
+**Gap.** `workspace_fingerprint(path)` hashes the raw path string without canonicalization. Two callers passing equivalent paths (e.g. `/tmp/foo` vs `/private/tmp/foo` on macOS where `/tmp` is a symlink to `/private/tmp`) get different fingerprints and therefore different session stores. #150 was the test-side symptom; the product contract itself is still fragile.
+
+**Discovery path.** #150 fix (canonicalize in test) was a workaround. Real users hit this whenever:
+1. Embedded callers pass a raw `--data-dir` path that differs from canonical `env::current_dir()`
+2. Programmatic use of `SessionStore::from_cwd(some_path)` with a non-canonical input
+3. Symlinks elsewhere in the filesystem (not just macOS `/tmp`): NixOS store paths, Docker bind mounts, network mounts with case-insensitive normalization, etc.
+
+The REPL's default flow happens to work because `env::current_dir()` returns canonicalized paths on macOS. But anyone calling `SessionStore::from_cwd()` with a user-supplied path risks silent session-store divergence.
+
+**Root cause.** The function treats path-string equality and path-equivalence as the same thing:
+
+```rust
+pub fn workspace_fingerprint(workspace_root: &Path) -> String {
+    let input = workspace_root.to_string_lossy();  // ← raw bytes
+    // ... FNV-1a hash ...
+}
+```
+
+**Fix shape (~10 lines).** Canonicalize inside `SessionStore::from_cwd()` (and `from_data_dir`) before computing the fingerprint. Keep `workspace_fingerprint()` itself as a pure function of its input for determinism — the canonicalization is the caller's responsibility, but the two production entry points should always canonicalize.
+
+```rust
+pub fn from_cwd(cwd: impl AsRef<Path>) -> Result<Self, SessionControlError> {
+    let cwd = cwd.as_ref();
+    // #151: canonicalize so that equivalent paths (symlinks, ./foo vs /abs/foo)
+    // produce the same workspace_fingerprint. Falls back to the raw path when
+    // canonicalize() fails (e.g. directory doesn't exist yet — callers that
+    // haven't materialized the workspace).
+    let canonical_cwd = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let sessions_root = canonical_cwd
+        .join(".claw")
+        .join("sessions")
+        .join(workspace_fingerprint(&canonical_cwd));
+    fs::create_dir_all(&sessions_root)?;
+    Ok(Self {
+        sessions_root,
+        workspace_root: canonical_cwd,
+    })
+}
+```
+
+**Backward compatibility.** Existing users on macOS where `env::current_dir()` already returns canonical paths: no change in hash. Users who ever called with a non-canonical path: hash would change, but those sessions were already broken (couldn't be resumed from a canonical-path cwd). Net improvement.
+
+**Acceptance.**
+- Revert the test-side workaround from #150; test still passes.
+- Add regression test: `SessionStore::from_cwd("/tmp/foo")` and `SessionStore::from_cwd("/private/tmp/foo")` return stores with identical `sessions_dir()` on macOS.
+- Workspace tests green.
+
+**Blocker.** None.
+
+**Source.** Q's ack on #150 surfaced the deeper gap: "#150 closed is real value" but the product function still has the brittleness. Session tally: ROADMAP #151.
+
+## Pinpoint #152. Diagnostic verb suffixes allow arbitrary positional args, emit double "error:" prefix
+
+**Gap.** Verbs like `claw doctor garbage` and `claw status foo bar` parse successfully instead of failing at parse time. The positional arguments fall through to the prompt-execution path, or in some cases the verb parser doesn't have a flag-only guard. Additionally, the error formatter doubles the "error:" prefix and doesn't hint at `--output-format json` for verbs that don't recognize `--json` as an alias.
+
+**Example failures:**
+- `claw doctor garbage` → silently treats "garbage" as a prompt instead of rejecting "doctor" as a verb with unexpected args
+- `claw system-prompt --json` → errors with "error: unknown option" but doesn't suggest `--output-format json`
+- Error messages show `error: error: <message>` (double prefix)
+
+**Fix shape (~30 lines).** Three improvements:
+1. Wire parse_verb_suffix to reject positional args after verbs (except multi-word prompts like "help me debug")
+2. Special-case `--json` in the verb-option error path to suggest `--output-format json`
+3. Remove the "error:" prefix from format_unknown_verb_option (already added by top-level handler)
+
+**Acceptance:** `claw doctor garbage` exits 1 with "unexpected positional argument"; `claw system-prompt --json` hints at `--output-format json`; error messages have single "error:" prefix.
+
+**Blocker.** None. Implementation exists on worktree `jobdori-127-verb-suffix` but needs rebase against main (conflicts with #141 which already shipped).
+
+**Source.** Clawhip nudge 2026-04-21 21:17 KST — "no excuses, always find something to ship" directive. Session tally: ROADMAP #152.
+
+## Pinpoint #153. README/USAGE missing "add binary to PATH" and "verify install" bridge
+
+**Gap.** After `cargo build --workspace`, new users don't know:
+1. Where the binary actually ends up (e.g., `rust/target/debug/claw` vs. expecting it in `/usr/local/bin`)
+2. How to verify the build succeeded (e.g., `claw --help`, `which claw`, `claw doctor`)
+3. How to add it to PATH for shell integration (optional but common follow-up)
+
+This creates a confusing gap: users build successfully but then get "command not found: claw" and assume the build failed, or they immediately ask "how do I install this properly?"
+
+**Real examples from #claw-code:**
+- "claw not found — did the build fail?"
+- "do I need to `cargo install` this?"
+- "why is the binary at `rust/target/debug/claw` and not just `claw`?"
+
+**Fix shape (~50 lines).** Add a new "Post-build verification and PATH" section in README (after Quick start) covering:
+1. **Where the binary lives:** `rust/target/debug/claw` (debug build) or `rust/target/release/claw` (release)
+2. **Verify it works:** Run `./rust/target/debug/claw --help` and `./rust/target/debug/claw doctor`
+3. **Optional: Add to PATH** — three approaches:
+   - symlink: `ln -s $(pwd)/rust/target/debug/claw /usr/local/bin/claw`
+   - `cargo install --path ./rust` (builds and installs to `~/.cargo/bin/`)
+   - update shell profile to export PATH
+4. **Windows equivalent:** Point to `rust\target\debug\claw.exe` and `cargo install --path .\rust`
+
+**Acceptance:** New users can find the binary location, run it directly, and know their first verification step is `claw doctor`.
+
+**Blocker:** None. Pure documentation.
+
+**Source:** Clawhip nudge 2026-04-21 21:27 KST — onboarding gap from #claw-code observations earlier this month.
+
+## Pinpoint #154. Model syntax error doesn't hint at env var when multiple credentials present
+
+**Gap.** When a user types `claw --model gpt-4` but only has `ANTHROPIC_API_KEY` set (no `OPENAI_API_KEY`), the error is:
+```
+error: invalid model syntax: 'gpt-4'. Expected provider/model (e.g., anthropic/claude-opus-4-6) or known alias (opus, sonnet, haiku)
+```
+
+But USAGE.md documents that "The error message now includes a hint that names the detected env var" — **this hint is not actually emitted.** The user gets a generic syntax error and has to re-read USAGE.md to discover they should type `openai/gpt-4` instead.
+
+**Expected behavior (from USAGE.md):** When the user has multiple providers' env vars set, or when a model name looks like it belongs to a different provider (e.g., `gpt-4` looks like OpenAI), the error should hint:
+- "Did you mean `openai/gpt-4`? (but `OPENAI_API_KEY` is not set)"
+- or "You have `ANTHROPIC_API_KEY` set but `gpt-4` looks like an OpenAI model. Try `openai/gpt-4` with `OPENAI_API_KEY` exported"
+
+**Current behavior:** Generic syntax error, user has to infer the fix from USAGE.md or guess.
+
+**Fix shape (~20 lines).** Enhance `FormatError::InvalidModelSyntax` or the model-parsing validation to:
+1. Detect if the model name looks like it belongs to a known provider (prefix `gpt-`, `openai/`, `qwen`, etc.)
+2. If it does, check if that provider's env var is missing
+3. Append a hint: "Did you mean \`{inferred_prefix}/{model}\`? (requires `{PROVIDER_KEY}` env var)"
+
+**Acceptance:** `claw --model gpt-4` produces a hint about OpenAI prefix and missing `OPENAI_API_KEY`. Same for `qwen-plus` → hint about `DASHSCOPE_API_KEY`, etc.
+
+**Blocker:** None. Pure error-message UX improvement.
+
+**Source:** Clawhip nudge 2026-04-21 21:37 KST — discovered during dogfood probing of model validation.
+
+## Pinpoint #155. USAGE.md missing docs for `/ultraplan`, `/teleport`, `/bughunter` commands
+
+**Gap.** The `claw --help` output lists three interactive slash commands that are not documented in USAGE.md:
+- `/ultraplan [task]` — Run a deep planning prompt with multi-step reasoning
+- `/teleport <symbol-or-path>` — Jump to a file or symbol by searching the workspace
+- `/bughunter [scope]` — Inspect the codebase for likely bugs
+
+New users see these commands in the help output but have no explanation of:
+1. What each does
+2. How to use it
+3. What kind of input it expects
+4. When to use it (vs. other commands)
+5. Any limitations or prerequisites
+
+**Impact.** Users run `/ultraplan` or `/teleport` out of curiosity, or they skip these commands because they don't understand them. Documentation should lower the barrier to discovery.
+
+**Fix shape (~100 lines).** Add a new section to USAGE.md after "Interactive slash commands" covering:
+1. **Planning & Reasoning** — `/ultraplan [task]`
+   - Purpose: extended multi-step reasoning over a task
+   - Input: a task description or problem statement
+   - Output: a structured plan with steps and reasoning
+   - Example: `/ultraplan refactor this module to use async/await`
+2. **Navigation** — `/teleport <symbol-or-path>`
+   - Purpose: quickly jump to a file or function by name
+   - Input: a symbol name (function, class, struct) or file path
+   - Output: the file content with that symbol highlighted
+   - Example: `/teleport UserService`, `/teleport src/auth.rs`
+3. **Code Analysis** — `/bughunter [scope]`
+   - Purpose: scan the codebase for likely bugs or issues
+   - Input: optional scope (e.g., "src/handlers", "lib.rs")
+   - Output: list of suspicious patterns with explanations
+   - Example: `/bughunter src`, `/bughunter` (entire workspace)
+
+**Acceptance:** Each command has a one-line description, a practical example, and expected behavior documented.
+
+**Blocker:** None. Pure documentation.
+
+**Source:** Clawhip nudge 2026-04-21 21:47 KST — discovered discrepancy between `claw --help` and USAGE.md coverage.
+
+## Pinpoint #156. Error classification for text-mode output (Phase 2 of #77)
+
+**Gap.** #77 Phase 1 added machine-readable `kind` discriminants to JSON error payloads. Text-mode errors still emit prose-only output with no structured classification.
+
+**Impact.** Observability tools that parse stderr (e.g., log aggregators, CI error parsers) can't distinguish error classes without regex or substring matching. Phase 1 solves it for JSON consumers; Phase 2 should extend the classification to text mode.
+
+**Fix shape (~20 lines).** Option A: Emit a `[error-kind: missing_credentials]` prefix line before the prose error so text parsers can quickly identify the class. Option B: Structured comment format like `# error_class=missing_credentials` at the end. Either way, the `kind` token should appear in text output as well.
+
+**Acceptance.** A stderr observer can distinguish `missing_credentials` from `session_not_found` from `cli_parse` without regex-scraping the full error prose.
+
+**Blocker.** None. Scope is small and non-breaking (adds a prefix or suffix, doesn't change existing error text).
+
+**Source.** Clayhip nudge 2026-04-21 23:18 — dogfood surface clean, Phase 1 proven solid, natural next step is symmetry across output formats.
+
+
+## Pinpoint #157. Structured remediation registry for error hints (Phase 3 of #77 / §4.44)
+
+**Gap.** #77 Phase 1 added machine-readable `kind` discriminants and #156 extended them to text-mode output. However, the `hint` field is still prose derived from splitting the existing error message text — not a stable, registry-backed remediation contract. Downstream claws inspecting the `hint` field still need to parse human wording to decide whether to retry, escalate, or terminate.
+
+**Impact.** A claw receiving `{"kind": "missing_credentials", "hint": "export ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY..."}` cannot programmatically determine the remediation action (e.g., `retry_with_env`, `escalate_to_operator`, `terminate_session`) without regex or substring matching on the hint prose. The `kind` is structured but the `hint` is not — half the error contract is still unstructured.
+
+**Fix shape.**
+
+1. **Remediation registry:** A function `remediation_for(kind: &str, operation: &str) -> Remediation` that maps `(error_kind, operation_context)` pairs to stable remediation structs:
+   ```rust
+   struct Remediation {
+       action: RemediationAction,  // retry, escalate, terminate, configure
+       target: &'static str,       // "env:ANTHROPIC_API_KEY", "config:model", etc.
+       message: &'static str,      // stable human-readable hint
+   }
+   ```
+2. **Stable hint outputs per class:** Each `error_kind` maps to exactly one remediation shape. No more prose splitting.
+3. **Golden fixture tests:** Test each `(kind, operation)` pair against expected remediation output as golden fixtures instead of the current `split_error_hint()` string hacks.
+
+**Acceptance.**
+- `remediation_for("missing_credentials", "prompt")` returns a stable struct with `action: Configure`, `target: "env:ANTHROPIC_API_KEY"`.
+- JSON output includes `remediation.action` and `remediation.target` fields.
+- Golden fixture tests cover all 12+ known error kinds.
+- `split_error_hint()` is replaced or deprecated.
+
+**Blocker.** None. Natural Phase 3 progression from #77 P1 (JSON kind) → #156 (text kind) → #157 (structured remediation).
+
+**Source.** gaebal-gajae dogfood sweep 2026-04-22 05:30 KST — identified that `kind` is structured but `hint` remains prose-derived, leaving downstream claws with half an error contract.
+
+## Pinpoint #158. `compact_messages_if_needed` drops turns silently — no structured compaction event emitted
+
+**Gap.** `QueryEnginePort.compact_messages_if_needed()` (`src/query_engine.py:129`) silently truncates `mutable_messages` and `transcript_store` whenever turn count exceeds `compact_after_turns` (default 12). The truncation is invisible to any consumer — `TurnResult` carries no compaction indicator, the streaming path emits no `compaction_occurred` event, and `persist_session()` persists only the post-compaction slice. A claw polling session state after compaction sees the same `session_id` but a different (shorter) context window with no structured signal that turns were dropped.
+
+**Repro.**
+```python
+import sys; sys.path.insert(0, 'src')
+from query_engine import QueryEnginePort, QueryEngineConfig
+
+engine = QueryEnginePort.from_workspace()
+engine.config = QueryEngineConfig(compact_after_turns=3)
+for i in range(5):
+    r = engine.submit_message(f'turn {i}')
+    # TurnResult has no compaction field
+    assert not hasattr(r, 'compaction_occurred')  # passes every time
+print(len(engine.mutable_messages))  # 3 — silently truncated from 5
+```
+
+**Root cause.** `compact_messages_if_needed` is called inside `submit_message` with no return value and no side-channel notification. `stream_submit_message` yields a `message_stop` event that includes `transcript_size` but not a `compaction_occurred` flag or `turns_dropped` count.
+
+**Fix shape (~15 lines).**
+1. Add `compaction_occurred: bool` and `turns_dropped: int` to `TurnResult`.
+2. In `compact_messages_if_needed`, return `(bool, int)` — whether compaction ran and how many turns were dropped.
+3. Propagate into `TurnResult` in `submit_message`.
+4. In `stream_submit_message`, include `compaction_occurred` and `turns_dropped` in the `message_stop` event.
+
+**Acceptance.** A claw watching the stream can detect that compaction occurred and how many turns were silently dropped, without polling `transcript_size` across two consecutive turns.
+
+**Blocker.** None.
+
+**Source.** Jobdori dogfood sweep 2026-04-22 06:36 KST — probed `query_engine.py` compact path, confirmed no structured compaction signal in `TurnResult` or stream output.
+
+## Pinpoint #159. `run_turn_loop` hardcodes empty denied_tools — permission denials silently absent from multi-turn sessions
+
+**Gap.** `PortRuntime.run_turn_loop` (`src/runtime.py:163`) calls `engine.submit_message(turn_prompt, command_names, tool_names, ())` with a hardcoded empty tuple for `denied_tools`. By contrast, `bootstrap_session` calls `_infer_permission_denials(matches)` and passes the result. Result: any tool that would be denied (e.g., bash-family tools gated as "destructive") silently appears unblocked across all turns in `turn-loop` mode. The `TurnResult.permission_denials` tuple is always empty for multi-turn runs, giving a false "clean" permission picture to any claw consuming those results.
+
+**Repro.**
+```python
+import sys; sys.path.insert(0, 'src')
+from runtime import PortRuntime
+results = PortRuntime().run_turn_loop('run bash ls', max_turns=2)
+for r in results:
+    assert r.permission_denials == ()  # passes — denials never surfaced
+```
+
+Compare `bootstrap_session` for the same prompt — it produces a `PermissionDenial` for bash-family tools.
+
+**Root cause.** `src/runtime.py:163` — `engine.submit_message(turn_prompt, command_names, tool_names, ())`. The `()` is a hardcoded literal; `_infer_permission_denials` is never called in the turn-loop path.
+
+**Fix shape (~5 lines).** Before the turn loop, compute:
+```python
+denials = tuple(self._infer_permission_denials(matches))
+```
+Then pass `denied_tools=denials` to every `submit_message` call inside the loop. Mirrors the existing pattern in `bootstrap_session`.
+
+**Acceptance.** `run_turn_loop('run bash ls').permission_denials` is non-empty and matches what `bootstrap_session` returns for the same prompt. Multi-turn session security posture is symmetric with single-turn bootstrap.
+
+**Blocker.** None.
+
+**Source.** Jobdori dogfood sweep 2026-04-22 06:46 KST — diffed `bootstrap_session` vs `run_turn_loop` in `src/runtime.py`, confirmed asymmetric permission denial propagation.
+
+## Pinpoint #160. `session_store` has no `list_sessions`, `delete_session`, or `session_exists` — claw cannot enumerate or clean up sessions without filesystem hacks
+
+**Gap.** `src/session_store.py` exposes exactly two public functions: `save_session` and `load_session`. There is no `list_sessions`, `delete_session`, or `session_exists`. Any claw that needs to enumerate stored sessions, verify a session exists before loading (to avoid `FileNotFoundError`), or clean up stale sessions must reach past the module and glob `DEFAULT_SESSION_DIR` directly. This couples callers to the on-disk layout (`<dir>/<session_id>.json`) and makes it impossible to swap storage backends (e.g., sqlite, remote store) without touching every call site.
+
+**Repro.**
+```python
+import sys; sys.path.insert(0, 'src')
+import session_store, inspect
+print([n for n, _ in inspect.getmembers(session_store, inspect.isfunction)
+       if not n.startswith('_')])
+# ['asdict', 'dataclass', 'load_session', 'save_session']
+# list_sessions, delete_session, session_exists — all absent
+```
+
+Try to enumerate sessions without the module:
+```python
+from pathlib import Path
+sessions = list((Path('.port_sessions')).glob('*.json'))
+# Works today, breaks if the dir layout ever changes — no abstraction layer
+```
+
+Try to load a session that doesn't exist:
+```python
+load_session('nonexistent')  # raises FileNotFoundError with no structured error type
+```
+
+**Root cause.** `src/session_store.py` was scaffolded with the minimum needed to save/load a single session and was never extended with the CRUD surface a claw actually needs to manage session lifecycle.
+
+**Fix shape (~25 lines).**
+1. `list_sessions(directory: Path | None = None) -> list[str]` — glob `*.json` in target dir, return sorted session ids (filename stems). Claws can call this to discover all stored sessions without touching the filesystem directly.
+2. `session_exists(session_id: str, directory: Path | None = None) -> bool` — `(target_dir / f'{session_id}.json').exists()`. Use before `load_session` to get a bool check instead of catching `FileNotFoundError`.
+3. `delete_session(session_id: str, directory: Path | None = None) -> bool` — unlink the file if present, return True on success, False if not found. Claws can use this for cleanup without knowing the path scheme.
+
+**Acceptance.** A claw can call `list_sessions()`, `session_exists(id)`, and `delete_session(id)` without importing `Path` or knowing the `.port_sessions/<id>.json` layout. `load_session` on a missing id raises a typed `SessionNotFoundError` subclass of `KeyError` (not `FileNotFoundError`) so callers can distinguish "not found" from IO errors.
+
+**Blocker.** None.
+
+**Source.** Jobdori dogfood sweep 2026-04-22 08:46 KST — inspected `src/session_store.py` public API, confirmed only `save_session` + `load_session` present, no list/delete/exists surface.
+200. **Interactive MCP/tool permission prompts are invisible blockers** — **done (verified 2026-04-27):** worker boot observation now detects interactive tool permission gates such as `Allow the omx_memory MCP server to run tool "project_memory_read"?` before generic readiness/idle handling, records `tool_permission_required` status, emits a structured `ToolPermissionPrompt` payload with server/tool identity, prompt age, allow-scope capability, and prompt preview, marks readiness snapshots as blocked, and carries `tool_permission_prompt_detected` through startup timeout evidence so the classifier returns `tool_permission_required` instead of a vague stale/idle/ready outcome. Regression coverage locks both the structured prompt-gate event metadata and startup-timeout classification paths. **Original filing below.**
+Original filing (2026-04-18): the session emitted `SessionStart hook (completed)` and `UserPromptSubmit hook (completed)`, then stalled on an interactive MCP permission gate (`Allow the omx_memory MCP server to run tool "project_memory_read"?`). From the outside this looks like a ready-but-quiet lane even though the real state is `blocked waiting for permission`. **Required fix shape:** (a) detect interactive MCP/tool permission prompts as a first-class blocked state instead of generic idle; (b) emit a typed event such as `blocked.mcp_permission` / `blocked.tool_permission` with tool/server name, prompt age, and whether the gate is session-only vs always-allow capable; (c) include this gate in startup/no-evidence evidence bundles and lane status surfaces so clawhip can say "blocked at MCP permission prompt" without pane scraping; (d) add a regression proving a prompt-gated session does not get misclassified as stale/idle/ready. **Why this matters:** prompt acceptance and startup telemetry are still incomplete if an interactive MCP gate can eat the first real action after hooks report success. Source: live dogfood session `clawcode-human` on 2026-04-18.
+
+201. **`extract --model-payload` is not inspectable enough for deterministic dogfood: forced mode selection missing, and hybrid/no-snippet cases are opaque** — dogfooded 2026-04-19 from `dogfood-1776184671` against three real-repo files. `node dist/cli/index.js extract <file> --model-payload` succeeded and auto-selected `raw`, `raw`, and `hybrid`, but there is currently no CLI surface to force `raw` / `compressed` / `hybrid` for A/B comparison: `--mode raw` and `--mode compressed` both fail immediately with `Error: Unexpected extract argument: --mode`. That turns payload-shaping validation into guesswork because operators cannot ask the extractor to render the same file through each mode and compare the exact output. The opacity is worse in the observed hybrid case: the Formbricks checkbox file produced a hybrid payload with no snippets, leaving no visible explanation for why the extractor chose hybrid, what evidence it kept vs dropped, or whether the result is correct vs a silent fallback. **Required fix shape:** (a) add an explicit debug/inspection flag that forces extraction mode (`--mode raw|compressed|hybrid` or equivalent) without changing default auto-selection; (b) print/report the chosen mode and the decision reason in a machine-readable field when `--model-payload` is used; (c) when hybrid emits zero snippets, surface an explicit reason/count summary instead of making "no snippets" indistinguishable from silent loss; (d) add regression coverage on at least one real-world hybrid fixture so mode choice and snippet accounting stay stable. **Why this matters:** direct claw-code dogfood needs deterministic payload comparison to debug startup/context quality; without forced-mode inspection and snippet accounting, operators can see the outcome but not the extraction decision that produced it. Source: live dogfood session `dogfood-1776184671` on 2026-04-19.
+
+202. **`extract --model-payload` emits `filePath` values that can walk outside the current repo root for external targets** — dogfooded 2026-04-19 from `dogfood-1776184671` while extracting files from sibling repos under `/home/bellman/Workspace/fooks-test-repos/...` with cwd anchored at the claw-code repo. In all three successful payloads (`raw`, `raw`, `hybrid`), the reported `filePath` became a relative path like `../../fooks-test-repos/...` that escapes the current repo root. Technically the path is still correct, but operationally it is a clawability gap: downstream consumers cannot tell whether this means "user intentionally extracted an external file", "path normalization leaked out of scope", or "the payload now references content outside the trusted working tree." That ambiguity is especially bad for model payloads because the `filePath` field looks like grounded provenance while actually encoding a cross-root escape. **Required fix shape:** (a) define a stable provenance contract for extracted targets outside cwd/repo root — for example an explicit `pathScope` / `targetRoot` field or an absolute-vs-relative policy instead of silently emitting `../..` escapes; (b) if relative paths are retained, add a machine-readable flag that the target is outside the current workspace/root; (c) document and test the normalization rule for sibling-repo extraction so downstream tooling does not mistake cross-root references for in-repo files; (d) add regression coverage for one in-repo fixture and one external-target fixture. **Why this matters:** model payload provenance should reduce ambiguity, not create a silent scope escape that later consumers have to reverse-engineer. Source: live dogfood session `dogfood-1776184671` on 2026-04-19.
+
+203. **Successful dogfood runs can still end in a misleading TUI/pane failure banner (`skills/list failed in TUI`, `can't find pane`)** — dogfooded 2026-04-19 from `dogfood-1776184671`. The session completed real work and produced a coherent result summary, but immediately afterward the surface emitted `Error: skills/list failed in TUI` and `can't find pane: %4766`. That creates a truth-ordering bug: the user just watched a successful run, then the final visible state looks like a transport/UI failure with no indication whether the underlying task failed, the pane disappeared after completion, or an unrelated post-run TUI refresh crashed. **Required fix shape:** (a) separate task result state from post-run TUI/skills refresh failures so a completed run cannot be visually overwritten by a secondary pane-lookup error; (b) classify missing-pane-after-completion as a typed transport/UI degradation with phase context (`post_result_refresh`, `skills_list_refresh`, etc.) instead of a generic terminal error; (c) preserve and surface the last successful task outcome even if the TUI follow-up step fails; (d) add regression coverage for the path where a pane disappears after result rendering so the session is reported as `completed_with_ui_warning` rather than plain failure. **Why this matters:** claw-code needs the final visible truth to match the actual execution truth; otherwise successful dogfood looks flaky and operators cannot tell whether to trust the result they just got. Source: live dogfood session `dogfood-1776184671` on 2026-04-19.
+
+204. **Interactive work can start with updater/setup churn before the actual user task, blurring startup truth and first-action latency** — dogfooded 2026-04-19 from `clawcode-human`. Launching `omx` inside the claw-code worktree did not begin with the requested ROADMAP task; it first diverted through an update prompt (`Update available: v0.12.6 → v0.13.0. Update now? [Y/n]`), global install, full setup refresh, config rewrite/backups, notification/HUD setup, and a `Restart to use new code` notice before returning to the actual prompt. None of that was the operator’s requested work, but it consumed the critical startup window and mixed setup chatter with task-relevant execution. This creates a clawability gap: downstream observers cannot cleanly distinguish `startup succeeded and work began` from `startup mutated the environment and maybe changed the toolchain before work began`, and first-action latency gets polluted by maintenance side effects. **Required fix shape:** (a) make updater/setup detours a first-class startup phase with explicit classification (`startup.update_gate`, `startup.setup_refresh`) instead of letting them masquerade as normal task progress; (b) allow noninteractive or automation-oriented launches to suppress or defer update/setup churn until after the first user task/result boundary; (c) preserve a clean timestamped boundary between maintenance work and task work in lane events/status surfaces; (d) add regression coverage proving a prompt can start without forced updater/setup interposition when policy says "do work now." **Why this matters:** startup truth should reflect the user’s requested work, not hide it behind self-mutation and config churn that change latency, logs, and reproducibility before the first real action. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+205. **Direct CLI dogfood is not self-starting when build artifacts are absent (`dist/cli/index.js` missing)** — dogfooded 2026-04-19 from `dogfood-1776184671`. The intended direct check was to run `node dist/cli/index.js extract ...`, but the first attempt hit a missing built artifact and the lane had to detour through `npm ci && npm run build` before any product behavior could be exercised. That means a "run the CLI directly in a fresh worktree" path is not actually one-step dogfoodable: the operator has to know the build prerequisite, spend time satisfying it, and then mentally separate build-system failures from product-surface failures. **Required fix shape:** (a) provide a supported direct-run entrypoint that either works from source without prebuilt `dist/` artifacts or emits a product-owned guidance error that names the exact one-shot bootstrap command; (b) surface build-artifact-missing as a typed startup/dependency prerequisite state rather than a raw module/file failure; (c) document and test the fresh-worktree direct-dogfood path so `extract --help` / `extract ... --model-payload` can be exercised without archaeology; (d) if build-on-demand is the intended contract, make it explicit and deterministic instead of requiring the operator to guess `npm ci && npm run build`. **Why this matters:** direct dogfood should fail on product behavior, not on hidden local build prerequisites that blur whether the tool is broken or merely unprepared. Source: live dogfood session `dogfood-1776184671` on 2026-04-19.
+
+206. **`extract --help` is not a safe/local help surface: after bootstrap it can still crash into a Node stack instead of rendering usage** — dogfooded 2026-04-19 from `dogfood-1776184671`. Even after repairing the missing-build-artifact prerequisite with `npm ci && npm run build`, the next expected low-risk probe `node dist/cli/index.js extract --help` did not cleanly print command help; it dropped into a Node failure at `dist/cli/index.js:52` and emitted a stack trace under `Node.js v25.1.0`. That means the help path itself is not trustworthy as a preflight surface: operators cannot rely on `--help` to discover flags or confirm command shape before doing real work, and they have to treat a basic introspection command like a potentially crashing code path. **Required fix shape:** (a) make `extract --help` and sibling help surfaces intercept locally before any heavier runtime path that can throw; (b) if a subcommand cannot render help because build/runtime prerequisites are missing, return a product-owned guidance error instead of a raw Node stack; (c) add regression coverage that `extract --help` succeeds in both a prepared worktree and a minimally bootstrapped one; (d) preserve the contract that help/usage discovery is the safest command family, not another execution path that can explode. **Why this matters:** help commands are supposed to reduce uncertainty; if they crash, dogfooders lose the cleanest way to learn the surface and every later failure gets harder to classify. Source: live dogfood session `dogfood-1776184671` on 2026-04-19.
+
+207. **Build/setup failures are being misclassified as generic missing-path shell errors in post-tool feedback** — dogfooded 2026-04-19 from `dogfood-1776184671`. When the lane attempted `node dist/cli/index.js extract --help` with no built artifact, the `PostToolUse` hook summarized it as ``Bash reported `command not found`, `permission denied`, or a missing file/path``, and later `npm run build` failed with actual TypeScript diagnostics (`TS2307: Cannot find module 'typescript'`, plus additional compile errors). Those are distinct failure classes — missing built artifact, missing dependency, and compile/typecheck red — but the feedback surface collapses them into the same mushy shell-triage bucket. That makes recovery slower because the operator has to reread raw pane output to learn whether the right next move is `npm ci`, fixing package deps, fixing TS errors, or checking file paths. **Required fix shape:** (a) classify post-tool failures with narrower machine-readable buckets such as `artifact_missing`, `dependency_missing`, `compile_error`, and reserve `missing_path` / `command_not_found` for the literal cases; (b) include the strongest observed diagnostic snippet (for example `TS2307 typescript missing`) in the structured feedback instead of only the broad shell rubric; (c) add regression coverage proving TypeScript/compiler failures are not surfaced as generic missing-path errors; (d) thread that typed classification into lane summaries so downstream claws can recommend the right recovery without pane archaeology. **Why this matters:** clawability depends on the fix suggestion matching the real failure class; broad shell-error mush turns easy recoveries into manual forensic work. Source: live dogfood session `dogfood-1776184671` on 2026-04-19.
+
+208. **The JavaScript `extract` dogfood path has no dedicated preflight/doctor surface for its own prerequisites** — dogfooded 2026-04-19 from `dogfood-1776184671`. The repo already has strong Rust-side `claw doctor` / preflight coverage, but the direct JS CLI path I was actually dogfooding (`node dist/cli/index.js extract ...`) gave no equivalent early warning about its own prerequisites: missing `dist/cli/index.js`, missing `node_modules/typescript`, and the difference between "needs bootstrap" vs "real compile error" all had to be discovered by failing real commands in sequence. That means the lowest-friction way to validate the JS extract surface is still failure-driven archaeology rather than one explicit readiness check. **Required fix shape:** (a) add a lightweight JS-side preflight/doctor command or bootstrap check for the extract CLI path that reports artifact presence, dependency readiness, and build status before execution; (b) make that check machine-readable so lanes can say `js_extract_prereq_blocked` (or equivalent) instead of learning via stack traces; (c) document the direct dogfood path so operators know whether the supported sequence is `doctor -> help -> extract` or something else; (d) add regression coverage for a fresh worktree, a deps-missing worktree, and a ready worktree. **Why this matters:** preflight should collapse obvious prerequisite failures into one cheap truth surface instead of forcing dogfooders to burn turns discovering them one crash at a time. Source: live dogfood session `dogfood-1776184671` on 2026-04-19.
+
+209. **`npm ci` can report a clean install while leaving the JS extract build path non-buildable (false-green bootstrap)** — dogfooded 2026-04-19 from `dogfood-1776184671`. The lane explicitly checked that `node_modules/typescript` was missing, then ran `npm ci`, which succeeded (`added 3 packages`, `found 0 vulnerabilities`), but the subsequent build path still surfaced a missing/invalid TypeScript toolchain situation instead of a clearly ready extract CLI bootstrap. From the operator side this is a false-green signal: the canonical package-manager bootstrap step says success, yet the next immediate action is still not reliably build-ready. Whether the root cause is missing declaration in `package.json`, lockfile drift, wrong dependency bucket, or build contract mismatch, the clawability gap is the same — `npm ci` success is not a trustworthy readiness signal for the JS extract path. **Required fix shape:** (a) define the exact dependency contract for the extract build path so `npm ci` alone yields a buildable state, or else emit an explicit follow-up requirement if another step is mandatory; (b) add a readiness assertion after install (for example checking required toolchain/deps like `typescript`) so bootstrap can fail closed instead of greenwashing; (c) add regression coverage that a clean install on a fresh worktree reaches a buildable/help-capable extract CLI state; (d) surface a typed `bootstrap_false_green` / `deps_incomplete_after_install` class when install succeeds but required build deps are still absent. **Why this matters:** bootstrap steps must mean what they say; a green install that leaves the next command red burns operator trust and makes every later failure harder to localize. Source: live dogfood session `dogfood-1776184671` on 2026-04-19.
+
+210. **Updater says `Restart to use new code`, but the same interactive session continues immediately with ambiguous code provenance** — dogfooded 2026-04-19 from `clawcode-human`. After the `omx` updater ran and explicitly reported `[omx] Updated to v0.13.0. Restart to use new code.`, the same visible interactive session proceeded straight into the requested task prompt instead of forcing or clearly fencing the restart boundary. That creates a stale-binary truth gap: neither the operator nor downstream claws can tell whether the subsequent behavior is coming from the newly installed version, the pre-update in-memory process, or some mixed state where setup artifacts are refreshed but the active runtime is still old. **Required fix shape:** (a) when an update declares restart-required, surface that as a first-class blocked/degraded state (`update_applied_restart_pending`) instead of silently continuing as if task execution provenance were clean; (b) either force a real restart before accepting task prompts or stamp all subsequent events with the pre-restart runtime identity until restart happens; (c) expose version-before/version-after/runtime-active-version distinctly in status surfaces; (d) add regression coverage proving that post-update task work cannot masquerade as running on the fresh version when restart is still pending. **Why this matters:** after self-update, code provenance is the truth boundary; if the tool says "restart required" but still keeps working, every later success or failure becomes harder to attribute to the right build. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+211. **The updater prompt is automation-hostile because it defaults to affirmative mutation (`Update now? [Y/n]`) during task startup** — dogfooded 2026-04-19 from `clawcode-human`. Before any requested work began, `omx` presented `Update available: v0.12.6 → v0.13.0. Update now? [Y/n]`, meaning the default Enter path mutates the toolchain in the middle of a task-start flow. Even if the operator notices and answers intentionally, the UX contract is backwards for automation-adjacent use: the least-effort path is "change the environment now" instead of "leave the task environment stable unless explicitly opted in." **Required fix shape:** (a) make startup-time updater prompts opt-in by default (`[y/N]`) or suppress them entirely in automation/worktree/task-launch contexts; (b) expose a policy switch so maintainers can choose `never`, `ask`, or `always` update behavior explicitly instead of hidden prompt defaults; (c) classify affirmative-default update prompts as startup mutation events in telemetry so they are visible in lane history; (d) add regression coverage proving a bare Enter during task startup does not silently opt into an update unless policy explicitly allows it. **Why this matters:** default-yes mutation is the wrong trust posture for reproducible dogfood and automation; task startup should preserve environment stability unless the operator deliberately chooses otherwise. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+212. **Promotional output is mixed into the task-start surface (`Support the project: gh repo star ...`), diluting operational signal** — dogfooded 2026-04-19 from `clawcode-human`. During the same startup flow that was supposed to move from update/setup into actual task work, `omx` printed a promotional line (`Support the project: gh repo star Yeachan-Heo/oh-my-codex`) directly in the operational transcript. This is not a correctness bug by itself, but it is a clawability gap: startup/task surfaces are where operators and downstream claws are trying to detect readiness, blockers, version provenance, and prompt receipt. Injecting marketing copy into that channel increases noise exactly where the signal budget is most precious. **Required fix shape:** (a) separate promotional/community messaging from operational startup/task transcripts, or gate it behind a quiet/noninteractive mode default for task launches; (b) mark any remaining non-operational lines with explicit metadata so downstream parsers can ignore them; (c) add a policy switch for quiet task-start surfaces vs interactive human-friendly onboarding; (d) add regression coverage proving task-start transcripts contain only operationally relevant lines in automation/worktree contexts. **Why this matters:** if the same channel carries both readiness truth and promo copy, claws have to waste effort distinguishing signal from fluff right when they should be classifying blockers and executing work. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+213. **Startup can silently enter a more destructive maintenance posture (`Force mode`) before task work begins** — dogfooded 2026-04-19 from `clawcode-human`. The updater/setup transcript included `Force mode: enabled additional destructive maintenance (for example stale deprecated skill cleanup).` in the middle of task startup. Even if the maintenance is legitimate, this is a clawability gap because the runtime is declaring that it has switched into a more destructive cleanup posture before the operator’s requested task has started, yet that posture change is not fenced as a separate trust boundary with explicit operator intent, policy context, or post-change state. **Required fix shape:** (a) treat force/destructive maintenance mode as a first-class startup state transition with explicit provenance and reason, not an inline informational line; (b) require explicit policy/consent in task-launch contexts before enabling destructive maintenance, especially when the user goal was unrelated to maintenance; (c) expose what was actually cleaned/removed under force mode in structured post-run state so the operator can audit side effects; (d) add regression coverage proving ordinary task startup cannot silently widen maintenance/destructive scope without a corresponding policy signal. **Why this matters:** startup should not quietly broaden its mutation/destructive radius under the same transcript used for task execution; when trust posture changes, that change needs to be explicit, auditable, and easy to distinguish from normal startup noise. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+214. **Task-start transcript leaks internal implementation/config choreography (`HUD config`, `[tui]` ownership, section-left-untouched notes) instead of surfacing only operator-relevant state** — dogfooded 2026-04-19 from `clawcode-human`. The startup/update flow printed lines like `HUD config created (preset: focused).` and `Codex CLI >= 0.107.0 manages [tui]; OMX left that section untouched.` Those may be useful during installer development, but on a task-start surface they are low-level implementation chatter: they expose config ownership details and internal orchestration mechanics that are not the operator’s actual question (`can work start yet? what changed? what is blocked?`). **Required fix shape:** (a) separate installer/debug implementation detail logs from the operator-facing startup/task transcript; (b) summarize them into a higher-level state only when they materially affect readiness (for example `ui_config_deferred_to_host_cli`), otherwise suppress them in normal task launches; (c) provide a verbose/debug mode where maintainers can still inspect the raw choreography intentionally; (d) add regression coverage proving default task-start transcripts carry readiness/provenance/blocker facts, not installer internals. **Why this matters:** when internal config chatter and operational truth share the same transcript, claws have to reverse-engineer which lines matter; startup should communicate state, not make maintainers parse implementation archaeology every run. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+215. **Setup-scope selection defaults to user/global mutation during task startup, creating project-vs-global provenance ambiguity** — dogfooded 2026-04-19 from `clawcode-human`. The updater/setup flow prompted `Select setup scope:` and defaulted to `1) user (default)`, then continued with `Using setup scope: user` and `User scope leaves project AGENTS.md unchanged.` In a task-launch context inside a specific project worktree, this is a clawability gap: the default mutation target is the operator’s global `~/.codex` environment rather than the current project, so the startup path can change cross-project state before the task even begins. That makes it ambiguous whether later behavior comes from project-local config, user-global config, or some mixed overlay. **Required fix shape:** (a) make scope choice explicit and policy-driven in task/worktree launches instead of defaulting silently to user/global scope; (b) expose the active config/provenance stack clearly after setup (`project`, `user`, or layered`) so later behavior can be attributed correctly; (c) allow automation/worktree mode to prefer or require project-local scope by default; (d) add regression coverage proving a bare Enter at setup-scope prompt does not unexpectedly widen mutation scope beyond the current project unless policy explicitly allows it. **Why this matters:** when startup mutates global state from inside a project task flow, reproducibility and blame assignment get muddy fast; scope is part of runtime truth and needs to be explicit, not an installer default hidden in startup chatter. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+216. **Installer refresh-count dumps (`updated=`, `unchanged=`, `skipped=`...) are mixed into task-start transcript even when the operator only needs readiness truth** — dogfooded 2026-04-19 from `clawcode-human`. The startup flow printed a full `Setup refresh summary:` block with counters for prompts, skills, native agents, AGENTS.md, and config. Those counters may be useful for installer debugging, but in a task-launch transcript they are mostly bookkeeping noise: they consume operator attention without answering the task-critical questions (`did startup finish? what mutated? is restart pending? can work begin?`). **Required fix shape:** (a) move raw refresh-count summaries behind verbose/debug output or a separate installer report surface; (b) collapse default task-start output to a higher-level mutation summary only when something materially changed; (c) mark detailed installer accounting as non-operational metadata when it must remain available; (d) add regression coverage proving default task-start transcripts do not include raw installer counter dumps in automation/worktree contexts. **Why this matters:** startup transcripts should optimize for execution truth, not make claws parse installer bookkeeping while they are trying to classify blockers and begin work. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+217. **Post-setup onboarding checklists (`Next steps:`) are injected into an already-active task-launch flow, re-framing the operator as a first-time user** — dogfooded 2026-04-19 from `clawcode-human`. After the updater/setup churn, the transcript printed a `Next steps:` block (`Start Codex CLI in your project directory`, `Browse skills with /skills`, `The AGENTS.md orchestration brain is loaded automatically`, etc.) immediately before the actual task prompt. In a live project-task session this is a clawability gap: the tool already knows it is inside a project directory and about to execute a concrete prompt, yet it still emits a generic first-run onboarding checklist that competes with the real work context. **Required fix shape:** (a) suppress or relocate first-run/onboarding guidance when the launch context is an active task/worktree session rather than a fresh human install flow; (b) surface onboarding guidance only when the runtime has evidence the user actually needs it; (c) keep detailed onboarding available via explicit help/doctor/docs surfaces instead of the main task-start transcript; (d) add regression coverage proving task-launch transcripts do not append generic `Next steps` blocks once the system has already crossed into execution mode. **Why this matters:** startup truth should narrow toward the requested task, not widen back out into beginner-mode guidance after the operator has already initiated concrete work. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+218. **Floating UX tips (`Tip: New Build faster with Codex.`) intrude into the task-start truth surface even when the session is about to execute real work** — dogfooded 2026-04-19 from `clawcode-human`. Right after the startup banner and before the actual task prompt took over, the surface displayed `Tip: New Build faster with Codex.` This kind of ambient tip may be harmless in a purely interactive onboarding context, but in a task-launch transcript it is another piece of non-operational noise competing with the real signals: readiness, prompt receipt, blocked state, restart pending, and execution provenance. **Required fix shape:** (a) suppress floating tips by default in task/worktree/automation launch contexts; (b) if tips remain in interactive mode, label them as ignorable non-operational UI hints outside the main transcript channel; (c) provide an explicit `tips=on/off/auto` policy so operators can keep startup surfaces quiet when they need clean telemetry; (d) add regression coverage proving task-start transcripts do not include generic tips once the system has enough context to know it is in execution mode. **Why this matters:** claws need startup transcripts to be high-signal; ambient tips are cheap for humans to ignore but expensive for automation and postmortem parsing because they widen the same channel that carries actual state transitions. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+219. **The full startup banner still occupies prime task-start transcript space even in an execution-bound session** — dogfooded 2026-04-19 from `clawcode-human`. Before any real work state was surfaced, the session rendered the large `OpenAI Codex (v0.120.0)` banner block with model and directory chrome. A banner is fine for an interactive REPL landing page, but in a task-launch/worktree context it is another large piece of non-operational framing that pushes actual readiness/provenance/blocker signals further down the transcript. This is distinct from the old piped-stdin bug (#48): here the issue is not wrong mode selection, but that once execution mode is already known, the banner still claims the most visible part of the startup surface. **Required fix shape:** (a) suppress or collapse the full banner in task/worktree/automation launches once the system knows it is entering execution immediately; (b) if some context is still useful, reduce it to one compact machine-readable/header line rather than a decorative block; (c) keep the full banner for explicit interactive landing contexts only; (d) add regression coverage proving execution-bound launches surface readiness/provenance first, not the decorative REPL chrome. **Why this matters:** startup transcript real estate is scarce; when the banner consumes the top of the screen, claws and operators pay a tax just to get to the lines that actually determine whether work can proceed. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+220. **Model/directory context is only exposed as decorative banner chrome instead of a stable structured startup state surface** — dogfooded 2026-04-19 from `clawcode-human`. The session showed useful facts like `model: gpt-5.4 high` and `directory: /mnt/offloading/Workspace/claw-code`, but only inside the decorative startup banner block. That means the context is visually present for a human yet not surfaced as a clearly structured, low-noise state line/event that claws can reliably consume once banners are suppressed or compacted. **Required fix shape:** (a) expose active model, cwd/project root, and similar startup context as a compact structured state surface independent of the decorative banner; (b) keep the data available even when banners are hidden in task/worktree/automation mode; (c) ensure downstream status/lane events can consume the same fields without scraping presentation text; (d) add regression coverage proving model/cwd context survives banner suppression and remains visible in a machine-usable form. **Why this matters:** some startup context is genuinely important, but if it only exists as banner chrome then operators must choose between noisy presentation and losing state; the truth should live in structured state, not decorative formatting. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+221. **Setup progress numbering uses ad-hoc fractional steps (`[5.5/8]`), which blurs startup phase truth instead of clarifying it** — dogfooded 2026-04-19 from `clawcode-human`. The updater/setup transcript labeled one phase as `[5.5/8] Verifying Team CLI API interop...`, which reads like an implementation-side patch to the step list rather than a stable user-facing phase model. It is a small thing, but it is a real clawability gap: when startup phase numbering itself looks improvised, operators and downstream claws cannot tell whether phases are canonical, inserted dynamically, optional, or comparable across runs. **Required fix shape:** (a) expose startup/setup phases as stable named states instead of ad-hoc fractional numbering; (b) if dynamic substeps are needed, nest them structurally under a parent phase instead of mutating the visible top-level ordinal; (c) make machine-readable startup telemetry use canonical phase ids rather than presentation-only counters; (d) add regression coverage proving startup phase sequencing remains stable even when intermediate validation steps are added. **Why this matters:** phase numbering should reduce ambiguity, not advertise that the startup model is being patched live; claws need stable phase identity for comparison, dedupe, and blocker attribution across runs. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+222. **Task-start transcript still tells the operator to `Run "omx doctor" to verify installation` even after the session has already crossed into active execution flow** — dogfooded 2026-04-19 from `clawcode-human`. The updater/setup path printed `Setup complete! Run "omx doctor" to verify installation.` immediately before continuing into the live project task prompt. In a first-run install flow that guidance is fine; in an already-active task/worktree launch it is a diversionary fork that reintroduces setup validation as if the operator were still onboarding instead of already trying to execute concrete work. **Required fix shape:** (a) suppress doctor/verification nudges once the runtime knows it is in an execution-bound task launch rather than a fresh install session; (b) if verification remains relevant, encode it as a structured optional recommendation separate from the main transcript, not a blocking-looking imperative sentence; (c) keep `doctor` guidance available on explicit help/status/install surfaces; (d) add regression coverage proving task-launch transcripts do not instruct users to re-verify installation mid-launch unless a real installation-health blocker is present. **Why this matters:** task-start truth should converge on the requested work; reintroducing `run doctor` guidance at the last moment makes the runtime look uncertain about whether startup is complete and distracts both humans and claws from execution. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+223. **Capability-detection chatter (`omx team api command detected`, `CLI-first interop ready`) leaks into task-start transcript instead of being summarized as stable readiness state** — dogfooded 2026-04-19 from `clawcode-human`. During setup the transcript printed lines like `omx team api command detected (CLI-first interop ready)`. That may be useful during installer debugging, but in a task-launch transcript it is low-level capability-probing chatter: it tells the operator how the installer discovered a capability instead of simply surfacing the resulting readiness fact, if that fact even matters to the current task. **Required fix shape:** (a) hide raw capability-detection chatter from the default task-start transcript; (b) if the result matters, summarize it as a stable named readiness capability or degraded state rather than a probe log; (c) keep raw probe details in verbose/debug output only; (d) add regression coverage proving startup surfaces do not emit ephemeral detection strings in execution-bound launches. **Why this matters:** claws need canonical state, not probe narration; when startup transcripts describe how readiness was detected rather than the readiness outcome itself, downstream consumers have to reverse-engineer transient strings instead of reading stable state. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+224. **Backup side effects are reported only as installer bookkeeping (`backed_up=...`) inside startup chatter instead of as an explicit auditable mutation surface** — dogfooded 2026-04-19 from `clawcode-human`. The setup refresh summary included counts like `config: updated=1, unchanged=1, backed_up=1`, which means startup created backup artifacts or backup state as part of the run. That is a real side effect, but it is only exposed as a counter inside noisy installer bookkeeping. In a task-launch context this is a clawability gap: backups are mutation/audit facts, not just installer trivia, and they should be easy to attribute and inspect without scraping summary counts. **Required fix shape:** (a) surface backup creation as an explicit structured mutation event (what was backed up, where, why) rather than only a counter; (b) keep backup/audit details in a dedicated mutation report separate from the main task-start transcript; (c) allow operators to inspect or suppress routine backup chatter without losing auditability; (d) add regression coverage proving backup side effects remain attributable even when installer counter dumps are hidden. **Why this matters:** when startup mutates disk state, the audit trail should be crisp and intentional; hiding backups inside generic `updated/unchanged/backed_up` counters makes real side effects look like disposable noise. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+225. **Installer mutation summaries are aggregate-only (`updated=`, `skipped=`, `removed=` counts) and hide which concrete artifacts changed** — dogfooded 2026-04-19 from `clawcode-human`. The `Setup refresh summary` reported counters for prompts, skills, native agents, AGENTS.md, and config, but not the identities of the files/items that were actually updated, skipped, backed up, or removed. That creates an item-level opacity gap: even when the operator accepts that startup did maintenance, they still cannot tell what concretely changed without diffing the filesystem or rerunning in a more verbose mode. **Required fix shape:** (a) expose a structured per-item mutation report (or stable pointer to one) alongside the aggregate counts; (b) let the default task-start transcript stay quiet while still preserving an auditable item list off the main path; (c) distinguish no-op categories from real mutated identities so downstream claws can tell whether a count reflects actual risk; (d) add regression coverage proving installer summaries remain attributable at the item level even when only compact high-level output is shown by default. **Why this matters:** counts alone are not enough for trust — when startup says it changed "some" prompts/skills/config, claws need a stable way to know exactly which artifacts moved without scraping or manual archaeology. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+226. **Installer summary status labels (`unchanged`, `skipped`, `removed`, `updated`) are not semantically crisp enough for downstream interpretation** — dogfooded 2026-04-19 from `clawcode-human`. The startup transcript emitted category counters like `updated=0, unchanged=20, skipped=13, removed=0`, but the semantics of those buckets are not self-evident in a machine-usable way: does `skipped` mean policy-blocked, out-of-scope, user-owned, version-pinned, or transient failure? Does `unchanged` mean verified identical, or merely not touched? That ambiguity makes the counts hard to trust even before item-level detail is considered. **Required fix shape:** (a) define stable semantics for each installer outcome bucket and expose them in machine-readable form; (b) avoid overloading `skipped`/`unchanged` for multiple reasons — use typed subreasons when needed; (c) ensure compact summaries can still distinguish harmless no-op from policy suppression or deferred action; (d) add regression coverage proving outcome labels remain stable and unambiguous across installer changes. **Why this matters:** if the status words themselves are fuzzy, aggregate counts become misleading telemetry — claws cannot tell whether startup was clean, partially suppressed, or silently deferred without reverse-engineering installer internals. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+227. **Task startup degrades into an interactive installer questionnaire (update? scope?) instead of a deterministic launch contract** — dogfooded 2026-04-19 from `clawcode-human`. Before any project work began, the launch path required answering multiple setup questions (`Update now? [Y/n]`, `Select setup scope: ... Scope [1-2]`) and only then continued into updater/setup churn and the eventual task prompt. This is a distinct clawability gap from the individual prompt defaults: even if each default were safer, the overall startup contract is still questionnaire-driven rather than deterministic. A task/worktree launch should be able to evaluate policy and either proceed or surface a typed blocked state, not stop for a mini installer interview. **Required fix shape:** (a) replace startup questionnaires with explicit policy-driven decisions and typed states (`update_required`, `scope_resolution_required`, etc.); (b) reserve interactive questioning for explicit install/setup commands, not ordinary task-launch paths; (c) provide a noninteractive/automation-safe mode where launch decisions are resolved from config/policy alone; (d) add regression coverage proving execution-bound launches either start deterministically or fail with structured blockers instead of pausing for ad-hoc Q&A. **Why this matters:** questionnaires destroy launch determinism; claws cannot reliably classify or replay startup when the runtime keeps asking humans to steer installer choices in the middle of task execution. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+228. **Startup success confirmations collapse into repeated generic `Done.` lines with weak object identity** — dogfooded 2026-04-19 from `clawcode-human`. Across the setup flow, multiple steps ended with bare confirmations like `Done.` after labels such as `Creating directories`, `Configuring notification hook`, and similar installer actions. That is a small but real event/log opacity gap: once the transcript gets longer, a claw or human skimming later cannot tell what exact artifact or side effect each `Done.` line is attesting to without walking back through the surrounding prose. **Required fix shape:** (a) emit success confirmations with stable object identity (`directories_created`, `notification_hook_configured`, etc.) instead of bare `Done.`; (b) keep human-friendly summaries if desired, but pair them with structured outcome ids; (c) make compact task-start transcripts collapse repetitive successful maintenance lines unless they materially affect readiness; (d) add regression coverage proving startup confirmations remain attributable even after transcript compaction or banner suppression. **Why this matters:** opaque success acknowledgments are the mirror image of opaque failures — if the runtime cannot say what specifically succeeded, later audits and parsers have to reconstruct state from surrounding noise instead of reading a stable event surface. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+229. **`Setup complete!` is emitted as a false-completion signal even while restart-required / execution-readiness ambiguity still exists** — dogfooded 2026-04-19 from `clawcode-human`. The startup flow printed `Setup complete!` even though the same transcript also said `Updated to v0.13.0. Restart to use new code.` and then continued into a noisy task-launch path with unclear runtime provenance. That makes `Setup complete!` a misleading terminal state label: it reads like the environment is fully ready and settled when in reality restart is still pending and execution truth is still muddy. **Required fix shape:** (a) reserve `complete`/`ready` language for genuinely execution-ready states only; (b) when restart or policy resolution is still pending, emit a degraded or transitional state instead (`setup_applied_restart_pending`, `setup_applied_not_ready`, etc.); (c) make human-facing copy and machine-facing state agree on whether the launch is actually ready for work; (d) add regression coverage proving no completion banner is shown while mandatory follow-up state (restart, consent, scope resolution) remains unresolved. **Why this matters:** false green completion signals poison the whole startup surface — once the runtime says `complete` too early, every later blocker or ambiguity looks like a contradiction instead of a known pending state. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+230. **Post-setup guidance can directly contradict observed reality (`Start Codex CLI in your project directory`) even though the session is already inside Codex in that directory** — dogfooded 2026-04-19 from `clawcode-human`. After startup had already entered the Codex UI and clearly showed `directory: /mnt/offloading/Workspace/claw-code`, the `Next steps:` block still instructed `Start Codex CLI in your project directory`. This is sharper than generic onboarding noise: it is self-contradicting guidance emitted in the same transcript that already proves the instruction has been satisfied. **Required fix shape:** (a) suppress any next-step/help guidance that is contradicted by current runtime state; (b) make onboarding copy state-aware so already-satisfied steps are removed or marked complete instead of repeated as advice; (c) ensure task-launch transcripts prefer observed facts over canned checklists; (d) add regression coverage proving startup help text does not instruct the user to do something the runtime already knows is true. **Why this matters:** contradictory guidance corrodes trust faster than generic noise — once the transcript tells the user to do something they are visibly already doing, every other startup instruction becomes suspect too. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+231. **Task-start transcript uses internal/anthropomorphic claims (`The AGENTS.md orchestration brain is loaded automatically`) instead of verifiable readiness facts** — dogfooded 2026-04-19 from `clawcode-human`. The `Next steps:` block included `The AGENTS.md orchestration brain is loaded automatically`, which is not a crisp operational fact but an internal/marketing-ish claim about the system’s conceptual model. In a task-launch transcript this is a clawability gap: the line sounds important, but it does not say what was actually loaded, how to verify it, or whether it affects current readiness. **Required fix shape:** (a) replace anthropomorphic/internal claims in startup/task surfaces with verifiable state facts (`AGENTS.md loaded: yes/no`, `policy file path`, `load source`, etc.) when such state matters; (b) keep conceptual/product-language copy out of operational transcripts or confine it to docs/onboarding surfaces; (c) make every startup claim testable against observable runtime state; (d) add regression coverage proving task-launch transcripts surface factual state instead of unverifiable product prose. **Why this matters:** claws can only reason over checkable truth; when startup surfaces speak in metaphor or internal branding, downstream consumers cannot distinguish “important state” from “colorful copy,” and auditability collapses. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+232. **Startup lacks a canonical final verdict line/state (`READY`, `BLOCKED`, `RESTART_REQUIRED`, etc.), forcing claws to infer readiness from noisy transcript fragments** — dogfooded 2026-04-19 from `clawcode-human`. After update prompts, scope questions, setup steps, summaries, tips, and onboarding chatter, the transcript never emitted one authoritative machine-usable outcome that settled the startup state. Instead, the operator had to infer from scattered lines like `Setup complete!`, `Restart to use new code.`, and subsequent prompt availability. This is a core event/log opacity gap: even if every individual line were cleaner, claws still need one canonical startup verdict to know whether the session is truly ready, degraded, blocked, or restart-pending. **Required fix shape:** (a) emit a single explicit startup outcome state at the end of launch (`ready`, `blocked`, `restart_required`, `setup_degraded`, etc.); (b) make that verdict authoritative over incidental transcript prose and reusable in lane/status events; (c) attach the minimal structured reasons that led to the verdict so downstream consumers do not have to scrape prior chatter; (d) add regression coverage proving every execution-bound launch terminates its startup phase with exactly one canonical verdict. **Why this matters:** without a final authoritative verdict, startup remains chat archaeology — claws cannot reliably decide whether to proceed, wait, or remediate because readiness lives only in the reader’s interpretation of noisy text. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+233. **Startup and task execution share one undifferentiated transcript stream; there is no explicit handoff boundary from setup/maintenance into real work** — dogfooded 2026-04-19 from `clawcode-human`. The same surface flowed from updater prompts, setup-scope questions, installer progress, summaries, tips, and onboarding text directly into the actual task prompt with no clean phase break that said “startup is over; execution has begun.” This is distinct from #232’s missing final verdict: even if a verdict existed, claws still need a visible handoff boundary so later lines can be interpreted as task execution rather than residual setup chatter. **Required fix shape:** (a) emit an explicit phase transition when control passes from startup/setup into execution (`startup_finished`, `execution_begin`, or equivalent); (b) keep startup/maintenance events logically grouped and separate from task-turn events in lane history; (c) make the handoff boundary machine-readable so downstream consumers can split logs without heuristic scraping; (d) add regression coverage proving execution-bound launches expose one clear startup→execution boundary even when startup performs updates or setup work first. **Why this matters:** without a crisp handoff, every later line is ambiguous — claws cannot tell whether they are reading installer residue or real task progress, so monitoring, replay, and blame assignment all stay fuzzy. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+234. **Startup phases expose almost no elapsed-time signal, so operators cannot tell which pre-task step actually consumed launch latency** — dogfooded 2026-04-19 from `clawcode-human`. The launch path spent real time in update prompting, setup scope selection, setup refresh, interop checks, config work, and onboarding chatter before real work began, but the transcript gave almost no per-phase timing or duration summary. That makes startup friction hard to localize: claws can see that startup felt long, but not whether the time went to update/install, config rewrite, capability probing, restart-pending drift, or UI chatter. **Required fix shape:** (a) attach elapsed timing to major startup phases and the final startup verdict; (b) expose a compact duration breakdown for update/setup/probe/handoff phases in machine-readable form; (c) keep detailed timings available even when the visible transcript is compacted; (d) add regression coverage proving execution-bound launches can report where pre-task latency was spent without log scraping. **Why this matters:** if startup latency is opaque, every slowdown becomes anecdotal. Claws need timing attribution to decide whether to suppress noise, precompute setup, change policy defaults, or fix a real blocker. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+235. **Startup decisions have no policy-source attribution, so prompts and mutations appear arbitrary (`why am I being asked to update/scope-switch/force-maintain?`)** — dogfooded 2026-04-19 from `clawcode-human`. The launch path asked about updates, defaulted to user scope, entered force mode, and emitted various setup actions, but the transcript never said which config, policy, default rule, or caller context caused those decisions. The operator can see *what* happened, but not *why this branch was chosen*. That creates a policy-opacity gap on top of the noise: even if the prompts were fewer, claws still could not audit whether a choice came from explicit config, a default fallback, current repo context, or installer hardcode. **Required fix shape:** (a) attach policy-source metadata to startup decisions (`source=config`, `source=default`, `source=interactive_override`, `source=repo_policy`, etc.); (b) surface compact reason/source tags for major mutations and prompts without dumping raw config internals; (c) make the final startup verdict include the key policy inputs that shaped launch; (d) add regression coverage proving update/scope/force-mode decisions remain attributable after transcript compaction. **Why this matters:** startup trust is not just about the visible action — it is about whether claws can trace that action back to an intentional policy source instead of treating it like arbitrary runtime whim. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+236. **Setup refresh has no drift/trigger explanation, so repeated pre-task maintenance looks unconditional even when it may be idempotent or unnecessary** — dogfooded 2026-04-19 from `clawcode-human`. The launch path ran a broad setup refresh and printed counts (`updated`, `unchanged`, `skipped`, `backed_up`), but never explained why this refresh was needed on this run: stale install detected, version mismatch, missing files, policy-enforced reapply, or just unconditional startup behavior. That leaves a critical ambiguity: the operator can see maintenance happened, but cannot tell whether it was justified by detected drift or simply rerun every time. **Required fix shape:** (a) emit a compact trigger reason for startup maintenance (`version_drift`, `missing_artifacts`, `policy_reapply`, `first_run`, `forced_refresh`, etc.); (b) include whether the refresh was necessary, opportunistic, or unconditional; (c) surface the trigger reason in the final startup verdict and structured mutation report; (d) add regression coverage proving repeated launches can distinguish "no drift, no refresh needed" from "refresh intentionally rerun because X." **Why this matters:** without drift/trigger attribution, startup maintenance feels arbitrary and expensive — claws cannot decide whether to cache, suppress, precompute, or eliminate the work because they do not know why it fired. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+237. **Repeated startup maintenance exposes no idempotence/fast-path signal, so claws cannot tell whether the runtime short-circuited safely or re-executed the whole setup pipeline** — dogfooded 2026-04-19 from `clawcode-human`. The setup flow reported lots of `unchanged` counts, but the transcript never made clear whether that meant a true cheap no-op fast path, a full scan/rewrite pass that happened to find no diffs, or a partially skipped installer run. This is distinct from #236’s missing trigger reason: even if a refresh was justified, the operator still cannot tell whether repeated launches are paying the full maintenance cost or benefiting from a stable idempotent shortcut. **Required fix shape:** (a) expose whether startup maintenance took a `fast_path`, `full_scan_noop`, `partial_reapply`, or `mutating_refresh` route; (b) include compact machine-readable idempotence metadata in startup verdicts and maintenance reports; (c) separate “no changes needed” from “work rerun but produced no diffs” so downstream systems can reason about startup cost; (d) add regression coverage proving repeated launches report a stable idempotence mode rather than forcing consumers to infer it from counters. **Why this matters:** idempotence is part of startup truth — without it, claws cannot optimize repeated launches or explain why startup still feels heavy even when nothing changed on disk. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+238. **Startup prompts do not preserve answer provenance (`explicit user choice` vs `accepted default`), so later audit cannot tell who actually chose update/scope branches** — dogfooded 2026-04-19 from `clawcode-human`. The launch flow showed questionnaire-style prompts such as `Update now? [Y/n]` and `Scope [1-2] (default: 1):`, but the resulting transcript only reflected the chosen path (`Using setup scope: user`, updater executed) without clearly recording whether those outcomes came from explicit operator input, default acceptance, automation, or some other implicit branch. That is a real audit gap: even if startup decisions become policy-driven later, the current surface cannot reconstruct whether a risky branch was intentionally chosen or simply happened because Enter accepted the default. **Required fix shape:** (a) record answer provenance for startup decisions (`explicit_input`, `default_accepted`, `policy_auto`, `preconfigured`) in machine-readable form; (b) surface compact provenance tags for consequential branches like update/scope/force mode; (c) thread answer provenance into the final startup verdict and audit trail; (d) add regression coverage proving startup decisions remain attributable after transcript compaction and banner suppression. **Why this matters:** when a launch mutates the environment, it is not enough to know what branch happened — claws need to know whether a human actually chose it or whether the system silently fell through to a default. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+239. **Startup transcript has no severity/importance layering, so blockers, mutations, info, and tips all compete at the same visual priority** — dogfooded 2026-04-19 from `clawcode-human`. In the same startup surface, lines about restart-required state, updater actions, setup mutations, promo copy, onboarding guidance, tips, and installer bookkeeping all appeared as ordinary transcript entries with no stable severity cues. That means the operator has to manually decide which lines are blockers, which are side-effect audit facts, and which are safely ignorable. **Required fix shape:** (a) assign stable severity/importance classes to startup events (`blocker`, `mutation`, `readiness`, `info`, `hint`, etc.); (b) make the final startup verdict and compact transcript prioritize blocker/readiness signals above all other classes; (c) let downstream consumers filter or collapse lower-severity startup chatter without losing auditability; (d) add regression coverage proving startup surfaces preserve severity ordering even when verbose output is enabled. **Why this matters:** even perfect wording is not enough if every line has equal visual weight — claws need severity structure so the startup surface can be parsed by priority instead of by brute-force reading order. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+240. **Startup mixes persistent mutations and ephemeral observations in the same plain-text channel, so operators cannot quickly tell what changed on disk/config versus what was merely detected** — dogfooded 2026-04-19 from `clawcode-human`. The transcript interleaved observations like capability detection, version notices, and tips with persistent side effects like config refreshes, backups, hook setup, and possible global-scope mutation, but rendered them all as ordinary prose lines. That makes audit and recovery harder: a claw reading back later cannot immediately separate "this was observed" from "this changed machine state." **Required fix shape:** (a) classify startup events by persistence class (`observation`, `decision`, `mutation`, `audit_artifact`) in addition to severity; (b) provide a compact mutation-only view or structured ledger for the startup run; (c) keep ephemeral observations available without letting them obscure which events actually changed durable state; (d) add regression coverage proving startup surfaces preserve the distinction between detected facts and persisted side effects. **Why this matters:** when startup changes the machine, claws need a fast path to the durable side effects. Without a persistence distinction, every audit becomes transcript archaeology instead of a clean state-change review. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+241. **Startup emits many lines but no stable startup-attempt/run id, so downstream claws cannot reliably group which prompts, mutations, and verdict belong to the same launch** — dogfooded 2026-04-19 from `clawcode-human`. The startup flow included update prompting, scope selection, setup steps, summaries, restart-required messaging, onboarding spillover, and then task execution, but none of those lines carried a shared startup correlation id. That makes analysis brittle once multiple launches or retries exist nearby: parsers have to infer grouping by proximity instead of knowing "these 23 lines belong to startup attempt X." **Required fix shape:** (a) assign a stable startup run id/correlation id at launch begin; (b) attach it to startup prompts, mutations, summaries, verdicts, and the startup→execution handoff; (c) preserve the id in compact transcript mode and structured lane/status events; (d) add regression coverage proving concurrent/retried launches remain separable without heuristic log scraping. **Why this matters:** without correlation identity, even improved startup events stay hard to stitch together across retries, compaction, and neighboring sessions. A canonical run id turns noisy startup text into a coherent attributable execution record. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+242. **Startup events have no stable sequence index inside a run, so downstream claws cannot reconstruct exact event order without trusting transcript layout** — dogfooded 2026-04-19 from `clawcode-human`. Even within one startup attempt, the flow mixed prompts, setup phases, summaries, restart-required signals, onboarding spillover, and the execution handoff without any monotonic event numbering or ordered machine-readable sequence marker. This is adjacent to #241 but distinct: a run id can tell you *which* launch a line belongs to, but not the exact canonical order of steps once output is compacted, reflowed, partially hidden, or merged into other status surfaces. **Required fix shape:** (a) assign a monotonic startup event sequence index within each startup run; (b) carry that sequence through structured startup events, summaries, and the final verdict/handoff; (c) preserve sequence identity when rendering compact human transcripts so downstream consumers can recover true order without scraping visual layout; (d) add regression coverage proving startup ordering remains reconstructable across retries, compaction, and alternate renderers. **Why this matters:** grouping without ordering is only half the audit trail. Claws need canonical event order to tell whether a blocker preceded a mutation, whether a verdict came before or after restart-required, and whether setup really finished before execution began. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+243. **Startup prompts ask for consent without previewing the concrete mutation plan, so `yes/no` decisions are under-informed** — dogfooded 2026-04-19 from `clawcode-human`. The launch path asked questions like `Update now? [Y/n]` and then proceeded into global install, setup refresh, config rewrites/backups, notification/HUD changes, possible force-mode maintenance, and restart-required state — but the prompt itself did not preview that concrete mutation set before asking for consent. This is a distinct clawability gap from policy/source attribution: even if the decision source were known, the operator still was not shown a compact “what will change if you say yes” plan before choosing. **Required fix shape:** (a) provide a concise mutation preview before consequential startup prompts (`will update package`, `may rewrite config`, `may create backups`, `restart required`, scope target, etc.); (b) make the preview machine-readable so automation and logs can capture the intended mutation set before execution; (c) allow policy-driven noninteractive mode to log the same preview as a preflight plan instead of asking interactively; (d) add regression coverage proving startup consent points expose their concrete planned side effects before mutation begins. **Why this matters:** consent without a change preview is barely better than blind defaulting — claws need to know not just that a branch exists, but what durable consequences that branch will have before they approve or auto-resolve it. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+244. **Startup has no dry-run / inspect-only path for mutation-heavy setup decisions, so the only way to learn what would happen is to start mutating** — dogfooded 2026-04-19 from `clawcode-human`. The launch path combined update prompting, scope selection, setup refresh, config rewrite/backups, force-mode maintenance, and restart-required drift, but there was no obvious dry-run or inspect-only startup contract that would let an operator ask “what would this launch do?” without already entering the mutation flow. This is adjacent to #243’s missing mutation preview, but broader: even a good inline preview still leaves no reusable no-side-effect mode for automation, audits, or preflight debugging. **Required fix shape:** (a) add a startup dry-run / inspect-only mode that evaluates policy, detects drift, computes the mutation plan, and emits the same canonical startup verdict without applying changes; (b) make that dry-run output machine-readable and structurally identical enough to compare with a real run; (c) ensure task/worktree automation can call the inspect path before deciding whether to allow mutation; (d) add regression coverage proving startup planning can be observed without side effects and that real execution matches the planned mutation set. **Why this matters:** when startup can rewrite global/user/project state, “show me the plan without touching anything” is a core clawability contract, not a luxury. Without it, every audit begins after the machine has already been changed. Source: live dogfood session `clawcode-human` on 2026-04-19.
+
+245. **`oc-work send` can fail as a silent control-plane misfire (usage dump / missing required context) instead of a typed delivery error with correction guidance** — dogfooded 2026-04-20 from the live #claw-code coordination lane while Jobdori tried to steer sisyphus on ROADMAP #127. The first `oc-work send` attempt printed underlying script usage (`Usage: send-prompt.sh ...`) because `--session` was missing, but from the outer operator view that looked like a vague tool hiccup rather than a precise control-plane delivery failure. The command only succeeded after manually discovering the active session id and reissuing with `--session ses_25725e95fffe882FpmeZNL1HdA`. **Required fix shape:** (a) promote missing required control-plane context (like target session id) into a typed `delivery_blocked_missing_session` / `invalid_send_target` error instead of raw usage echo from an inner script; (b) when a send command can infer or list likely active session ids, surface that guidance directly in the error; (c) ensure failed sends emit an explicit `not delivered` outcome so operators do not confuse usage text with successful steering; (d) add regression coverage proving `oc-work send` failures preserve operator intent, classify the missing arg correctly, and never masquerade as opaque shell noise. **Why this matters:** control-plane misfires are worse than ordinary tool failures because they create false confidence that steering happened when it did not. For multi-agent clawhip/agentika loops, send-path auditability has to be crisp. Source: live Jobdori / agentika steering thread in #claw-code on 2026-04-20.
+
+246. **Dogfood reminder cron can self-fail by timing out during active cycles, so the nudge loop itself is not trustworthy as an observability surface** — dogfooded 2026-04-21 in `#clawcode-building-in-public` after multiple consecutive alerts: `Cron job "clawcode-dogfood-cycle-reminder" failed: cron: job execution timed out` at 14:14, 14:24, 14:34, 14:44, 15:13, and 15:23 KST while the same dogfood cycle was actively producing reports and fixes. This is not just scheduler noise — it is a clawability gap in the reminder/control loop itself. A downstream claw seeing both repeated dogfood nudges and repeated cron timeouts cannot tell whether the reminder actually delivered, partially delivered, duplicated, or died after side effects. **Required fix shape:** (a) classify reminder execution outcome explicitly (`delivered`, `timed_out_after_send`, `timed_out_before_send`, `suppressed_as_duplicate`, `skipped_due_to_active_cycle`) instead of a single generic timeout; (b) attach the target message/report cycle id and whether a Discord post was already emitted before timeout; (c) add a fast-path/no-op path when the cycle state is unchanged or an active report is already in flight so the reminder job can exit cleanly instead of hanging; (d) add regression coverage proving repeated unchanged-state cycles do not stack timeouts or duplicate nudges. **Why this matters:** if the reminder loop itself is ambiguous, claws waste time responding to scheduler artifacts instead of real product state, and the dogfood surface stops being a reliable source of truth. Source: live clawhip/Jobdori dogfood cycle on 2026-04-21 with repeated timeout alerts in `#clawcode-building-in-public`.
+
+247. **MCP memory permission prompts can recur after a transport failure, leaving an active worker blocked in a second consent loop instead of a typed degraded state** — dogfooded 2026-04-27 from live session `clawcode-human` while responding to the claw-code dogfood nudge. The session first asked permission for `omx_memory.project_memory_read`; after approval, the call failed with `Transport closed`, then the runtime immediately attempted `omx_memory.notepad_read` and blocked again on a fresh allow prompt. From the outside this looks like an automation-hostile MCP lifecycle gap: the worker is neither cleanly ready nor cleanly failed, and downstream claws must scrape the pane to learn that memory MCP is both consent-gated and transport-degraded. **Required fix shape:** (a) after an MCP transport closes, emit a typed degraded state such as `mcp_transport_closed` with server/tool identity; (b) suppress or batch follow-up permission prompts for the same failed MCP server until transport recovery is proven; (c) expose whether the task can continue without that MCP tool or is blocked on memory; (d) add regression coverage for `permission granted -> transport closed -> follow-up tool attempt` so it becomes one structured blocker instead of repeated interactive consent loops. **Why this matters:** MCP memory should either be available, explicitly degraded, or explicitly blocked; repeated permission prompts after a closed transport make prompt delivery and readiness ambiguous. Source: live `clawcode-human` pane on 2026-04-27 04:3x UTC.

@@ -43,6 +43,35 @@ cd rust
 /doctor
 ```
 
+Or run doctor directly with JSON output for scripting:
+
+```bash
+cd rust
+./target/debug/claw doctor --output-format json
+```
+
+**Note:** Diagnostic verbs (`doctor`, `status`, `sandbox`, `version`) support `--output-format json` for machine-readable output. Invalid suffix arguments (e.g., `--json`) are now rejected at parse time rather than falling through to prompt dispatch.
+
+### Initialize a repository
+
+Set up a new repository with `.claw` config, `.claw.json`, `.gitignore` entries, and a `CLAUDE.md` guidance file:
+
+```bash
+cd /path/to/your/repo
+./target/debug/claw init
+```
+
+Text mode (human-readable) shows artifact creation summary with project path and next steps. Idempotent — running multiple times in the same repo marks already-created files as "skipped".
+
+JSON mode for scripting:
+```bash
+./target/debug/claw init --output-format json
+```
+
+Returns structured output with `project_path`, `created[]`, `updated[]`, `skipped[]` arrays (one per artifact), and `artifacts[]` carrying each file's `name` and machine-stable `status` tag. The legacy `message` field preserves backward compatibility.
+
+**Why structured fields matter:** Claws can detect per-artifact state (`created` vs `updated` vs `skipped`) without substring-matching human prose. Use the `created[]`, `updated[]`, and `skipped[]` arrays for conditional follow-up logic (e.g., only commit if files were actually created, not just updated).
+
 ### Interactive REPL
 
 ```bash
@@ -70,6 +99,85 @@ cd rust
 cd rust
 ./target/debug/claw --output-format json prompt "status"
 ```
+
+### Inspect worker state
+
+The `claw state` command reads `.claw/worker-state.json`, which is written by the interactive REPL or a one-shot prompt when a worker executes a task. This file contains the worker ID, session reference, model, and permission mode.
+
+Prerequisite: You must run `claw` (interactive REPL) or `claw prompt <text>` at least once in the repository to produce the worker state file.
+
+```bash
+cd rust
+./target/debug/claw state
+```
+
+JSON mode:
+```bash
+./target/debug/claw state --output-format json
+```
+
+If you run `claw state` before any worker has executed, you will see a helpful error:
+```
+error: no worker state file found at .claw/worker-state.json
+  Hint: worker state is written by the interactive REPL or a non-interactive prompt.
+  Run:   claw               # start the REPL (writes state on first turn)
+  Or:    claw prompt <text> # run one non-interactive turn
+  Then rerun: claw state [--output-format json]
+```
+
+## Advanced slash commands (Interactive REPL only)
+
+These commands are available inside the interactive REPL (`claw` with no args). They extend the assistant with workspace analysis, planning, and navigation features.
+
+### `/ultraplan` — Deep planning with multi-step reasoning
+
+**Purpose:** Break down a complex task into steps using extended reasoning.
+
+```bash
+# Start the REPL
+claw
+
+# Inside the REPL
+/ultraplan refactor the auth module to use async/await
+/ultraplan design a caching layer for database queries
+/ultraplan analyze this module for performance bottlenecks
+```
+
+Output: A structured plan with numbered steps, reasoning for each step, and expected outcomes. Use this when you want the assistant to think through a problem in detail before coding.
+
+### `/teleport` — Jump to a file or symbol
+
+**Purpose:** Quickly navigate to a file, function, class, or struct by name.
+
+```bash
+# Jump to a symbol
+/teleport UserService
+/teleport authenticate_user
+/teleport RequestHandler
+
+# Jump to a file
+/teleport src/auth.rs
+/teleport crates/runtime/lib.rs
+/teleport ./ARCHITECTURE.md
+```
+
+Output: The file content, with the requested symbol highlighted or the file fully loaded. Useful for exploring the codebase without manually navigating directories. If multiple matches exist, the assistant shows the top candidates.
+
+### `/bughunter` — Scan for likely bugs and issues
+
+**Purpose:** Analyze code for common pitfalls, anti-patterns, and potential bugs.
+
+```bash
+# Scan the entire workspace
+/bughunter
+
+# Scan a specific directory or file
+/bughunter src/handlers
+/bughunter rust/crates/runtime
+/bughunter src/auth.rs
+```
+
+Output: A list of suspicious patterns with explanations (e.g., "unchecked unwrap()", "potential race condition", "missing error handling"). Each finding includes the file, line number, and suggested fix. Use this as a first pass before a full code review.
 
 ## Model and permission controls
 

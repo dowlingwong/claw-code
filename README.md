@@ -98,10 +98,87 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 
 **Git Bash / WSL** are optional alternatives, not requirements. If you prefer bash-style paths (`/c/Users/you/...` instead of `C:\Users\you\...`), Git Bash (ships with Git for Windows) works well. In Git Bash, the `MINGW64` prompt is expected and normal — not a broken install.
 
+## Post-build: locate the binary and verify
+
+After running `cargo build --workspace`, the `claw` binary is built but **not** automatically installed to your system. Here's where to find it and how to verify the build succeeded.
+
+### Binary location
+
+After `cargo build --workspace` in `claw-code/rust/`:
+
+**Debug build (default, faster compile):**
+- **macOS/Linux:** `rust/target/debug/claw`
+- **Windows:** `rust/target/debug/claw.exe`
+
+**Release build (optimized, slower compile):**
+- **macOS/Linux:** `rust/target/release/claw`
+- **Windows:** `rust/target/release/claw.exe`
+
+If you ran `cargo build` without `--release`, the binary is in the `debug/` folder.
+
+### Verify the build succeeded
+
+Test the binary directly using its path:
+
+```bash
+# macOS/Linux (debug build)
+./rust/target/debug/claw --help
+./rust/target/debug/claw doctor
+
+# Windows PowerShell (debug build)
+.\rust\target\debug\claw.exe --help
+.\rust\target\debug\claw.exe doctor
+```
+
+If these commands succeed, the build is working. `claw doctor` is your first health check — it validates your API key, model access, and tool configuration.
+
+### Optional: Add to PATH
+
+If you want to run `claw` from any directory without the full path, choose one of these approaches:
+
+**Option 1: Symlink (macOS/Linux)**
+```bash
+ln -s $(pwd)/rust/target/debug/claw /usr/local/bin/claw
+```
+Then reload your shell and test:
+```bash
+claw --help
+```
+
+**Option 2: Use `cargo install` (all platforms)**
+
+Build and install to Cargo's default location (`~/.cargo/bin/`, which is usually on PATH):
+```bash
+# From the claw-code/rust/ directory
+cargo install --path . --force
+
+# Then from anywhere
+claw --help
+```
+
+**Option 3: Update shell profile (bash/zsh)**
+
+Add this line to `~/.bashrc` or `~/.zshrc`:
+```bash
+export PATH="$(pwd)/rust/target/debug:$PATH"
+```
+
+Reload your shell:
+```bash
+source ~/.bashrc  # or source ~/.zshrc
+claw --help
+```
+
+### Troubleshooting
+
+- **"command not found: claw"** — The binary is in `rust/target/debug/claw`, but it's not on your PATH. Use the full path `./rust/target/debug/claw` or symlink/install as above.
+- **"permission denied"** — On macOS/Linux, you may need `chmod +x rust/target/debug/claw` if the executable bit isn't set (rare).
+- **Debug vs. release** — If the build is slow, you're in debug mode (default). Add `--release` to `cargo build` for faster runtime, but the build itself will take 5–10 minutes.
+
 > [!NOTE]
 > **Auth:** claw requires an **API key** (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.) — Claude subscription login is not a supported auth path.
 
-Run the workspace test suite:
+Run the workspace test suite after verifying the binary works:
 
 ```bash
 cd rust
