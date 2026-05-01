@@ -228,8 +228,10 @@ fn main() {
             // don't need to regex-scrape the prose.
             let kind = classify_error_kind(&message);
             if message.contains("`claw --help`") {
-                eprintln!("[error-kind: {kind}]
-error: {message}");
+                eprintln!(
+                    "[error-kind: {kind}]
+error: {message}"
+                );
             } else {
                 eprintln!(
                     "[error-kind: {kind}]
@@ -419,19 +421,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Config {
             section,
             output_format,
-        } => {
-            match output_format {
-                CliOutputFormat::Text => {
-                    println!("{}", render_config_report(section.as_deref())?);
-                }
-                CliOutputFormat::Json => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&render_config_json(section.as_deref())?)?
-                    );
-                }
+        } => match output_format {
+            CliOutputFormat::Text => {
+                println!("{}", render_config_report(section.as_deref())?);
             }
-        }
+            CliOutputFormat::Json => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&render_config_json(section.as_deref())?)?
+                );
+            }
+        },
         CliAction::Diff { output_format } => match output_format {
             CliOutputFormat::Text => {
                 println!("{}", render_diff_report()?);
@@ -635,13 +635,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             "--help" | "-h"
                 if !rest.is_empty()
-                    && matches!(
-                        rest[0].as_str(),
-                        "prompt"
-                            | "commit"
-                            | "pr"
-                            | "issue"
-                    ) =>
+                    && matches!(rest[0].as_str(), "prompt" | "commit" | "pr" | "issue") =>
             {
                 // `--help` following a subcommand that would otherwise forward
                 // the arg to the API (e.g. `claw prompt --help`) should show
@@ -1327,7 +1321,6 @@ fn suggest_closest_term<'a>(input: &str, candidates: &'a [&'a str]) -> Option<&'
     ranked_suggestions(input, candidates).into_iter().next()
 }
 
-
 fn suggest_similar_subcommand(input: &str) -> Option<Vec<String>> {
     const KNOWN_SUBCOMMANDS: &[&str] = &[
         "help",
@@ -1357,8 +1350,7 @@ fn suggest_similar_subcommand(input: &str) -> Option<Vec<String>> {
             let prefix_match = common_prefix_len(&normalized_input, &normalized_candidate) >= 4;
             let substring_match = normalized_candidate.contains(&normalized_input)
                 || normalized_input.contains(&normalized_candidate);
-            ((distance <= 2) || prefix_match || substring_match)
-                .then_some((distance, *candidate))
+            ((distance <= 2) || prefix_match || substring_match).then_some((distance, *candidate))
         })
         .collect::<Vec<_>>();
     ranked.sort_by(|left, right| left.cmp(right).then_with(|| left.1.cmp(right.1)));
@@ -1377,7 +1369,6 @@ fn common_prefix_len(left: &str, right: &str) -> usize {
         .take_while(|(l, r)| l == r)
         .count()
 }
-
 
 fn looks_like_subcommand_typo(input: &str) -> bool {
     !input.is_empty()
@@ -1487,13 +1478,11 @@ fn validate_model_syntax(model: &str) -> Result<(), String> {
             err_msg.push_str("\nDid you mean `openai/");
             err_msg.push_str(trimmed);
             err_msg.push_str("`? (Requires OPENAI_API_KEY env var)");
-        }
-        else if trimmed.starts_with("qwen") {
+        } else if trimmed.starts_with("qwen") {
             err_msg.push_str("\nDid you mean `qwen/");
             err_msg.push_str(trimmed);
             err_msg.push_str("`? (Requires DASHSCOPE_API_KEY env var)");
-        }
-        else if trimmed.starts_with("grok") {
+        } else if trimmed.starts_with("grok") {
             err_msg.push_str("\nDid you mean `xai/");
             err_msg.push_str(trimmed);
             err_msg.push_str("`? (Requires XAI_API_KEY env var)");
@@ -1972,6 +1961,7 @@ fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
         project_root,
         git_branch,
         git_summary,
+        session_lifecycle: classify_session_lifecycle_for(&cwd),
         sandbox_status: resolve_sandbox_status(sandbox_config.sandbox(), &cwd),
         // Doctor path has its own config check; StatusContext here is only
         // fed into health renderers that don't read config_load_error.
@@ -2816,6 +2806,7 @@ struct StatusContext {
     project_root: Option<PathBuf>,
     git_branch: Option<String>,
     git_summary: GitWorkspaceSummary,
+    session_lifecycle: SessionLifecycleSummary,
     sandbox_status: runtime::SandboxStatus,
     /// #143: when `.claw.json` (or another loaded config file) fails to parse,
     /// we capture the parse error here and still populate every field that
@@ -2843,6 +2834,75 @@ struct GitWorkspaceSummary {
     unstaged_files: usize,
     untracked_files: usize,
     conflicted_files: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionLifecycleKind {
+    RunningProcess,
+    IdleShell,
+    SavedOnly,
+}
+
+impl SessionLifecycleKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RunningProcess => "running_process",
+            Self::IdleShell => "idle_shell",
+            Self::SavedOnly => "saved_only",
+        }
+    }
+
+    fn human_label(self) -> &'static str {
+        match self {
+            Self::RunningProcess => "running process",
+            Self::IdleShell => "idle shell",
+            Self::SavedOnly => "saved only",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionLifecycleSummary {
+    kind: SessionLifecycleKind,
+    pane_id: Option<String>,
+    pane_command: Option<String>,
+    pane_path: Option<PathBuf>,
+    workspace_dirty: bool,
+    abandoned: bool,
+}
+
+impl SessionLifecycleSummary {
+    fn signal(&self) -> String {
+        let mut parts = vec![self.kind.human_label().to_string()];
+        if self.workspace_dirty {
+            parts.push("dirty worktree".to_string());
+        }
+        if self.abandoned {
+            parts.push("abandoned?".to_string());
+        }
+        if let Some(command) = self.pane_command.as_deref() {
+            parts.push(format!("cmd={command}"));
+        }
+        parts.join(" · ")
+    }
+
+    fn json_value(&self) -> serde_json::Value {
+        json!({
+            "kind": self.kind.as_str(),
+            "pane_id": self.pane_id,
+            "pane_command": self.pane_command,
+            "pane_path": self.pane_path.as_ref().map(|path| path.display().to_string()),
+            "workspace_dirty": self.workspace_dirty,
+            "abandoned": self.abandoned,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TmuxPaneSnapshot {
+    pane_id: String,
+    current_command: String,
+    current_path: PathBuf,
 }
 
 impl GitWorkspaceSummary {
@@ -2874,6 +2934,120 @@ impl GitWorkspaceSummary {
             )
         }
     }
+}
+
+fn classify_session_lifecycle_for(workspace: &Path) -> SessionLifecycleSummary {
+    classify_session_lifecycle_from_panes(workspace, discover_tmux_panes())
+}
+
+fn classify_session_lifecycle_from_panes(
+    workspace: &Path,
+    panes: Vec<TmuxPaneSnapshot>,
+) -> SessionLifecycleSummary {
+    let workspace_dirty = git_worktree_is_dirty(workspace);
+    let mut idle_shell = None;
+    for pane in panes {
+        if !pane_path_matches_workspace(&pane.current_path, workspace) {
+            continue;
+        }
+        if is_idle_shell_command(&pane.current_command) {
+            idle_shell.get_or_insert(pane);
+        } else {
+            return SessionLifecycleSummary {
+                kind: SessionLifecycleKind::RunningProcess,
+                pane_id: Some(pane.pane_id),
+                pane_command: Some(pane.current_command),
+                pane_path: Some(pane.current_path),
+                workspace_dirty,
+                abandoned: false,
+            };
+        }
+    }
+
+    if let Some(pane) = idle_shell {
+        SessionLifecycleSummary {
+            kind: SessionLifecycleKind::IdleShell,
+            pane_id: Some(pane.pane_id),
+            pane_command: Some(pane.current_command),
+            pane_path: Some(pane.current_path),
+            workspace_dirty,
+            abandoned: workspace_dirty,
+        }
+    } else {
+        SessionLifecycleSummary {
+            kind: SessionLifecycleKind::SavedOnly,
+            pane_id: None,
+            pane_command: None,
+            pane_path: None,
+            workspace_dirty,
+            abandoned: workspace_dirty,
+        }
+    }
+}
+
+fn discover_tmux_panes() -> Vec<TmuxPaneSnapshot> {
+    let output = Command::new("tmux")
+        .args([
+            "list-panes",
+            "-a",
+            "-F",
+            "#{pane_id}\t#{pane_current_command}\t#{pane_current_path}",
+        ])
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_tmux_pane_snapshots(&stdout)
+}
+
+fn parse_tmux_pane_snapshots(output: &str) -> Vec<TmuxPaneSnapshot> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(3, '\t');
+            let pane_id = fields.next()?.trim();
+            let current_command = fields.next()?.trim();
+            let current_path = fields.next()?.trim();
+            if pane_id.is_empty() || current_path.is_empty() {
+                return None;
+            }
+            Some(TmuxPaneSnapshot {
+                pane_id: pane_id.to_string(),
+                current_command: current_command.to_string(),
+                current_path: PathBuf::from(current_path),
+            })
+        })
+        .collect()
+}
+
+fn pane_path_matches_workspace(pane_path: &Path, workspace: &Path) -> bool {
+    let pane_path = fs::canonicalize(pane_path).unwrap_or_else(|_| pane_path.to_path_buf());
+    let workspace = fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    pane_path == workspace || pane_path.starts_with(&workspace)
+}
+
+fn is_idle_shell_command(command: &str) -> bool {
+    let command = command.rsplit('/').next().unwrap_or(command);
+    matches!(
+        command,
+        "bash" | "zsh" | "sh" | "fish" | "nu" | "pwsh" | "powershell" | "cmd"
+    )
+}
+
+fn git_worktree_is_dirty(workspace: &Path) -> bool {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["status", "--porcelain"])
+        .output();
+    output
+        .ok()
+        .filter(|output| output.status.success())
+        .is_some_and(|output| !output.stdout.is_empty())
 }
 
 #[cfg(test)]
@@ -3418,6 +3592,18 @@ fn run_resume_command(
         } if act == "list" => {
             let sessions = list_managed_sessions().unwrap_or_default();
             let session_ids: Vec<String> = sessions.iter().map(|s| s.id.clone()).collect();
+            let session_details: Vec<serde_json::Value> = sessions
+                .iter()
+                .map(|session| {
+                    serde_json::json!({
+                        "id": session.id,
+                        "path": session.path.display().to_string(),
+                        "message_count": session.message_count,
+                        "updated_at_ms": session.updated_at_ms,
+                        "lifecycle": session.lifecycle.json_value(),
+                    })
+                })
+                .collect();
             let active_id = session.session_id.clone();
             let text = render_session_list(&active_id).unwrap_or_else(|e| format!("error: {e}"));
             Ok(ResumeCommandOutcome {
@@ -3426,6 +3612,7 @@ fn run_resume_command(
                 json: Some(serde_json::json!({
                     "kind": "session_list",
                     "sessions": session_ids,
+                    "session_details": session_details,
                     "active": active_id,
                 })),
             })
@@ -3657,6 +3844,7 @@ struct ManagedSessionSummary {
     message_count: usize,
     parent_session_id: Option<String>,
     branch_name: Option<String>,
+    lifecycle: SessionLifecycleSummary,
 }
 
 struct LiveCli {
@@ -4337,7 +4525,6 @@ impl LiveCli {
         println!("{final_text}");
         Ok(())
     }
-
 
     fn run_prompt_compact_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
@@ -5263,7 +5450,9 @@ fn resolve_managed_session_path(session_id: &str) -> Result<PathBuf, Box<dyn std
 }
 
 fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::error::Error>> {
-    Ok(current_session_store()?
+    let store = current_session_store()?;
+    let lifecycle = classify_session_lifecycle_for(store.workspace_root());
+    Ok(store
         .list_sessions()
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?
         .into_iter()
@@ -5275,12 +5464,15 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
             message_count: session.message_count,
             parent_session_id: session.parent_session_id,
             branch_name: session.branch_name,
+            lifecycle: lifecycle.clone(),
         })
         .collect())
 }
 
 fn latest_managed_session() -> Result<ManagedSessionSummary, Box<dyn std::error::Error>> {
-    let session = current_session_store()?
+    let store = current_session_store()?;
+    let lifecycle = classify_session_lifecycle_for(store.workspace_root());
+    let session = store
         .latest_session()
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     Ok(ManagedSessionSummary {
@@ -5291,6 +5483,7 @@ fn latest_managed_session() -> Result<ManagedSessionSummary, Box<dyn std::error:
         message_count: session.message_count,
         parent_session_id: session.parent_session_id,
         branch_name: session.branch_name,
+        lifecycle,
     })
 }
 
@@ -5355,8 +5548,9 @@ fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::e
             (None, None) => String::new(),
         };
         lines.push(format!(
-            "  {id:<20} {marker:<10} msgs={msgs:<4} modified={modified}{lineage} path={path}",
+            "  {id:<20} {marker:<10} lifecycle={lifecycle} msgs={msgs:<4} modified={modified}{lineage} path={path}",
             id = session.id,
+            lifecycle = session.lifecycle.signal(),
             msgs = session.message_count,
             modified = format_session_modified_age(session.modified_epoch_millis),
             lineage = lineage,
@@ -5457,7 +5651,13 @@ fn print_status_snapshot(
     match output_format {
         CliOutputFormat::Text => println!(
             "{}",
-            format_status_report(&provenance.resolved, usage, permission_mode.as_str(), &context, Some(&provenance))
+            format_status_report(
+                &provenance.resolved,
+                usage,
+                permission_mode.as_str(),
+                &context,
+                Some(&provenance)
+            )
         ),
         CliOutputFormat::Json => println!(
             "{}",
@@ -5533,6 +5733,7 @@ fn status_json_value(
                 // .claw/sessions/. Extract the stem (drop the .jsonl extension).
                 path.file_stem().map(|n| n.to_string_lossy().into_owned())
             }),
+            "session_lifecycle": context.session_lifecycle.json_value(),
             "loaded_config_files": context.loaded_config_files,
             "discovered_config_files": context.discovered_config_files,
             "memory_file_count": context.memory_file_count,
@@ -5588,7 +5789,7 @@ fn status_context(
         parse_git_status_metadata(project_context.git_status.as_deref());
     let git_summary = parse_git_workspace_summary(project_context.git_status.as_deref());
     Ok(StatusContext {
-        cwd,
+        cwd: cwd.clone(),
         session_path: session_path.map(Path::to_path_buf),
         loaded_config_files,
         discovered_config_files,
@@ -5596,6 +5797,7 @@ fn status_context(
         project_root,
         git_branch,
         git_summary,
+        session_lifecycle: classify_session_lifecycle_for(&cwd),
         sandbox_status,
         config_load_error,
     })
@@ -5669,6 +5871,7 @@ fn format_status_report(
   Unstaged         {}
   Untracked        {}
   Session          {}
+  Lifecycle        {}
   Config files     loaded {}/{}
   Memory files     {}
   Suggested flow   /status → /diff → /commit",
@@ -5687,6 +5890,7 @@ fn format_status_report(
                 || "live-repl".to_string(),
                 |path| path.display().to_string()
             ),
+            context.session_lifecycle.signal(),
             context.loaded_config_files,
             context.discovered_config_files,
             context.memory_file_count,
@@ -8958,6 +9162,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out)?;
     let resume_commands = resume_supported_slash_commands()
         .into_iter()
+        .filter(|spec| !STUB_COMMANDS.contains(&spec.name))
         .map(|spec| match spec.argument_hint {
             Some(argument_hint) => format!("/{} {}", spec.name, argument_hint),
             None => format!("/{}", spec.name),
@@ -9031,30 +9236,29 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 mod tests {
     use super::{
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
-        collect_session_prompt_history, create_managed_session_handle, describe_tool_progress,
-        filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
-        format_commit_skipped_report, format_compact_report, format_connected_line,
-        format_cost_report, format_history_timestamp, format_internal_prompt_progress_line,
-        format_issue_report, format_model_report, format_model_switch_report,
-        format_permissions_report, format_permissions_switch_report, format_pr_report,
-        format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
-        format_ultraplan_report, format_unknown_slash_command,
+        classify_error_kind, classify_session_lifecycle_from_panes, collect_session_prompt_history,
+        create_managed_session_handle, describe_tool_progress, filter_tool_specs,
+        format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
+        format_compact_report, format_connected_line, format_cost_report, format_history_timestamp,
+        format_internal_prompt_progress_line, format_issue_report, format_model_report,
+        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
+        format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
+        format_tool_result, format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
-        classify_error_kind,
         merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
         parse_history_count, permission_policy, print_help_to, push_output_block,
-        render_config_report, render_diff_report, render_diff_report_for, render_memory_report,
-        split_error_hint,
-        render_help_topic, render_prompt_history_report, render_repl_help, render_resume_usage,
-        render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
-        resolve_repl_model, resolve_session_reference, response_to_events,
-        resume_supported_slash_commands, run_resume_command, short_tool_id,
-        slash_command_completion_candidates_with_sessions, status_context,
-        summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt, validate_no_args,
-        write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
-        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        PromptHistoryEntry, SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
+        render_config_report, render_diff_report, render_diff_report_for, render_help_topic,
+        render_memory_report, render_prompt_history_report, render_repl_help, render_resume_usage,
+        render_session_list, render_session_markdown, resolve_model_alias,
+        resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
+        response_to_events, resume_supported_slash_commands, run_resume_command, short_tool_id,
+        slash_command_completion_candidates_with_sessions, split_error_hint, status_context,
+        status_json_value, summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt,
+        validate_no_args, write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor,
+        GitWorkspaceSummary, InternalPromptProgressEvent, InternalPromptProgressState, LiveCli,
+        LocalHelpTopic, PromptHistoryEntry, SessionLifecycleKind, SessionLifecycleSummary,
+        SlashCommand, StatusUsage, TmuxPaneSnapshot, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
         STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
@@ -10043,8 +10247,8 @@ mod tests {
         // with a specific error instead of falling through to the prompt
         // path (where they surface a misleading "missing Anthropic
         // credentials" error or burn API tokens on an empty prompt).
-        let empty_err = parse_args(&["".to_string()])
-            .expect_err("empty positional arg should be rejected");
+        let empty_err =
+            parse_args(&["".to_string()]).expect_err("empty positional arg should be rejected");
         assert!(
             empty_err.starts_with("empty prompt:"),
             "empty-arg error should be specific, got: {empty_err}"
@@ -10261,7 +10465,8 @@ mod tests {
         .expect("write malformed .claw.json");
 
         let context = with_current_dir(&cwd, || {
-            super::status_context(None).expect("status_context should not hard-fail on config parse errors (#143)")
+            super::status_context(None)
+                .expect("status_context should not hard-fail on config parse errors (#143)")
         });
 
         // Phase 1 contract: config_load_error is populated with the parse error.
@@ -10322,15 +10527,23 @@ mod tests {
             json.get("model").and_then(|v| v.as_str()),
             Some("test-model")
         );
-        assert!(json.get("workspace").is_some(), "workspace field still reported");
-        assert!(json.get("sandbox").is_some(), "sandbox field still reported");
+        assert!(
+            json.get("workspace").is_some(),
+            "workspace field still reported"
+        );
+        assert!(
+            json.get("sandbox").is_some(),
+            "sandbox field still reported"
+        );
         assert_eq!(
-            json.pointer("/allowed_tools/source").and_then(|v| v.as_str()),
+            json.pointer("/allowed_tools/source")
+                .and_then(|v| v.as_str()),
             Some("default"),
             "default status should expose unrestricted tool source: {json}"
         );
         assert_eq!(
-            json.pointer("/allowed_tools/restricted").and_then(|v| v.as_bool()),
+            json.pointer("/allowed_tools/restricted")
+                .and_then(|v| v.as_bool()),
             Some(false),
             "default status should expose unrestricted tool state: {json}"
         );
@@ -10477,11 +10690,18 @@ mod tests {
         // Other unrecognized args should NOT trigger the --json hint.
         let err_other = parse_args(&["doctor".to_string(), "garbage".to_string()])
             .expect_err("`doctor garbage` should fail without --json hint");
-        assert!(!err_other.contains("--output-format json"),
-            "unrelated args should not trigger --json hint: {err_other}");
+        assert!(
+            !err_other.contains("--output-format json"),
+            "unrelated args should not trigger --json hint: {err_other}"
+        );
         // #154: model syntax error should hint at provider prefix when applicable
-        let err_gpt = parse_args(&["prompt".to_string(), "test".to_string(), "--model".to_string(), "gpt-4".to_string()])
-            .expect_err("`--model gpt-4` should fail with OpenAI hint");
+        let err_gpt = parse_args(&[
+            "prompt".to_string(),
+            "test".to_string(),
+            "--model".to_string(),
+            "gpt-4".to_string(),
+        ])
+        .expect_err("`--model gpt-4` should fail with OpenAI hint");
         assert!(
             err_gpt.contains("Did you mean `openai/gpt-4`?"),
             "GPT model error should hint openai/ prefix: {err_gpt}"
@@ -10490,8 +10710,13 @@ mod tests {
             err_gpt.contains("OPENAI_API_KEY"),
             "GPT model error should mention env var: {err_gpt}"
         );
-        let err_qwen = parse_args(&["prompt".to_string(), "test".to_string(), "--model".to_string(), "qwen-plus".to_string()])
-            .expect_err("`--model qwen-plus` should fail with DashScope hint");
+        let err_qwen = parse_args(&[
+            "prompt".to_string(),
+            "test".to_string(),
+            "--model".to_string(),
+            "qwen-plus".to_string(),
+        ])
+        .expect_err("`--model qwen-plus` should fail with DashScope hint");
         assert!(
             err_qwen.contains("Did you mean `qwen/qwen-plus`?"),
             "Qwen model error should hint qwen/ prefix: {err_qwen}"
@@ -10501,8 +10726,13 @@ mod tests {
             "Qwen model error should mention env var: {err_qwen}"
         );
         // Unrelated invalid model should NOT get a hint
-        let err_garbage = parse_args(&["prompt".to_string(), "test".to_string(), "--model".to_string(), "asdfgh".to_string()])
-            .expect_err("`--model asdfgh` should fail");
+        let err_garbage = parse_args(&[
+            "prompt".to_string(),
+            "test".to_string(),
+            "--model".to_string(),
+            "asdfgh".to_string(),
+        ])
+        .expect_err("`--model asdfgh` should fail");
         assert!(
             !err_garbage.contains("Did you mean"),
             "Unrelated model errors should not get a hint: {err_garbage}"
@@ -10512,15 +10742,42 @@ mod tests {
     #[test]
     fn classify_error_kind_returns_correct_discriminants() {
         // #77: error kind classification for JSON error payloads
-        assert_eq!(classify_error_kind("missing Anthropic credentials; export ..."), "missing_credentials");
-        assert_eq!(classify_error_kind("no worker state file found at /tmp/..."), "missing_worker_state");
-        assert_eq!(classify_error_kind("session not found: abc123"), "session_not_found");
-        assert_eq!(classify_error_kind("failed to restore session: no managed sessions found"), "session_load_failed");
-        assert_eq!(classify_error_kind("unrecognized argument `--foo` for subcommand `doctor`"), "cli_parse");
-        assert_eq!(classify_error_kind("invalid model syntax: 'gpt-4'. Expected ..."), "invalid_model_syntax");
-        assert_eq!(classify_error_kind("unsupported resumed command: /blargh"), "unsupported_resumed_command");
-        assert_eq!(classify_error_kind("api failed after 3 attempts: ..."), "api_http_error");
-        assert_eq!(classify_error_kind("something completely unknown"), "unknown");
+        assert_eq!(
+            classify_error_kind("missing Anthropic credentials; export ..."),
+            "missing_credentials"
+        );
+        assert_eq!(
+            classify_error_kind("no worker state file found at /tmp/..."),
+            "missing_worker_state"
+        );
+        assert_eq!(
+            classify_error_kind("session not found: abc123"),
+            "session_not_found"
+        );
+        assert_eq!(
+            classify_error_kind("failed to restore session: no managed sessions found"),
+            "session_load_failed"
+        );
+        assert_eq!(
+            classify_error_kind("unrecognized argument `--foo` for subcommand `doctor`"),
+            "cli_parse"
+        );
+        assert_eq!(
+            classify_error_kind("invalid model syntax: 'gpt-4'. Expected ..."),
+            "invalid_model_syntax"
+        );
+        assert_eq!(
+            classify_error_kind("unsupported resumed command: /blargh"),
+            "unsupported_resumed_command"
+        );
+        assert_eq!(
+            classify_error_kind("api failed after 3 attempts: ..."),
+            "api_http_error"
+        );
+        assert_eq!(
+            classify_error_kind("something completely unknown"),
+            "unknown"
+        );
     }
 
     #[test]
@@ -10991,7 +11248,6 @@ mod tests {
         assert!(report.contains("Use /help"));
     }
 
-
     #[test]
     fn typoed_doctor_subcommand_returns_did_you_mean_error() {
         let error = parse_args(&["doctorr".to_string()]).expect_err("doctorr should error");
@@ -11073,7 +11329,6 @@ mod tests {
             }
         );
     }
-
 
     #[test]
     fn punctuation_bearing_single_token_still_dispatches_to_prompt() {
@@ -11594,6 +11849,14 @@ mod tests {
                     untracked_files: 1,
                     conflicted_files: 0,
                 },
+                session_lifecycle: SessionLifecycleSummary {
+                    kind: SessionLifecycleKind::IdleShell,
+                    pane_id: Some("%7".to_string()),
+                    pane_command: Some("zsh".to_string()),
+                    pane_path: Some(PathBuf::from("/tmp/project")),
+                    workspace_dirty: true,
+                    abandoned: true,
+                },
                 sandbox_status: runtime::SandboxStatus::default(),
                 config_load_error: None,
             },
@@ -11616,9 +11879,147 @@ mod tests {
         assert!(status.contains("Unstaged         1"));
         assert!(status.contains("Untracked        1"));
         assert!(status.contains("Session          session.jsonl"));
+        assert!(
+            status.contains("Lifecycle        idle shell · dirty worktree · abandoned? · cmd=zsh")
+        );
         assert!(status.contains("Config files     loaded 2/3"));
         assert!(status.contains("Memory files     4"));
         assert!(status.contains("Suggested flow   /status → /diff → /commit"));
+    }
+
+    #[test]
+    fn session_lifecycle_prefers_running_process_over_idle_shell() {
+        let workspace = PathBuf::from("/tmp/project");
+        let lifecycle = classify_session_lifecycle_from_panes(
+            &workspace,
+            vec![
+                TmuxPaneSnapshot {
+                    pane_id: "%1".to_string(),
+                    current_command: "zsh".to_string(),
+                    current_path: workspace.clone(),
+                },
+                TmuxPaneSnapshot {
+                    pane_id: "%2".to_string(),
+                    current_command: "claw".to_string(),
+                    current_path: workspace.join("rust"),
+                },
+            ],
+        );
+
+        assert_eq!(lifecycle.kind, SessionLifecycleKind::RunningProcess);
+        assert_eq!(lifecycle.pane_id.as_deref(), Some("%2"));
+        assert_eq!(lifecycle.pane_command.as_deref(), Some("claw"));
+        assert!(!lifecycle.abandoned);
+    }
+
+    #[test]
+    fn session_lifecycle_marks_dirty_idle_shell_as_abandoned() {
+        let _guard = env_lock();
+        let workspace = temp_workspace("dirty-idle-shell");
+        fs::create_dir_all(&workspace).expect("workspace should create");
+        git(&["init", "--quiet"], &workspace);
+        git(&["config", "user.email", "tests@example.com"], &workspace);
+        git(&["config", "user.name", "Rusty Claude Tests"], &workspace);
+        fs::write(workspace.join("tracked.txt"), "hello\n").expect("write tracked");
+        git(&["add", "tracked.txt"], &workspace);
+        git(&["commit", "-m", "init", "--quiet"], &workspace);
+        fs::write(workspace.join("tracked.txt"), "hello\nchanged\n").expect("dirty tracked");
+
+        let lifecycle = classify_session_lifecycle_from_panes(
+            &workspace,
+            vec![TmuxPaneSnapshot {
+                pane_id: "%3".to_string(),
+                current_command: "bash".to_string(),
+                current_path: workspace.clone(),
+            }],
+        );
+
+        assert_eq!(lifecycle.kind, SessionLifecycleKind::IdleShell);
+        assert!(lifecycle.workspace_dirty);
+        assert!(lifecycle.abandoned);
+
+        fs::remove_dir_all(workspace).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn session_list_surfaces_saved_dirty_abandoned_lifecycle() {
+        let _guard = cwd_guard();
+        let workspace = temp_workspace("session-list-lifecycle");
+        fs::create_dir_all(&workspace).expect("workspace should create");
+        git(&["init", "--quiet"], &workspace);
+        git(&["config", "user.email", "tests@example.com"], &workspace);
+        git(&["config", "user.name", "Rusty Claude Tests"], &workspace);
+        fs::write(workspace.join(".gitignore"), ".claw/\n").expect("write gitignore");
+        fs::write(workspace.join("tracked.txt"), "hello\n").expect("write tracked");
+        git(&["add", ".gitignore", "tracked.txt"], &workspace);
+        git(&["commit", "-m", "init", "--quiet"], &workspace);
+
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("switch cwd");
+        let handle = create_managed_session_handle("session-alpha").expect("session handle");
+        Session::new()
+            .with_workspace_root(workspace.clone())
+            .with_persistence_path(handle.path.clone())
+            .save_to_path(&handle.path)
+            .expect("session should save");
+        fs::write(workspace.join("tracked.txt"), "hello\nchanged\n").expect("dirty tracked");
+
+        let report = render_session_list("session-alpha").expect("session list should render");
+
+        assert!(report.contains("session-alpha"));
+        assert!(report.contains("lifecycle=saved only · dirty worktree · abandoned?"));
+
+        std::env::set_current_dir(previous).expect("restore cwd");
+        fs::remove_dir_all(workspace).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn status_json_surfaces_session_lifecycle_for_clawhip() {
+        let context = super::StatusContext {
+            cwd: PathBuf::from("/tmp/project"),
+            session_path: None,
+            loaded_config_files: 0,
+            discovered_config_files: 0,
+            memory_file_count: 0,
+            project_root: Some(PathBuf::from("/tmp/project")),
+            git_branch: Some("feature/session-lifecycle".to_string()),
+            git_summary: GitWorkspaceSummary::default(),
+            session_lifecycle: SessionLifecycleSummary {
+                kind: SessionLifecycleKind::RunningProcess,
+                pane_id: Some("%9".to_string()),
+                pane_command: Some("claw".to_string()),
+                pane_path: Some(PathBuf::from("/tmp/project")),
+                workspace_dirty: false,
+                abandoned: false,
+            },
+            sandbox_status: runtime::SandboxStatus::default(),
+            config_load_error: None,
+        };
+
+        let value = status_json_value(
+            Some("claude-sonnet"),
+            StatusUsage {
+                message_count: 0,
+                turns: 0,
+                latest: runtime::TokenUsage::default(),
+                cumulative: runtime::TokenUsage::default(),
+                estimated_tokens: 0,
+            },
+            "workspace-write",
+            &context,
+            None,
+            None,
+        );
+
+        assert_eq!(
+            value["workspace"]["session_lifecycle"]["kind"],
+            "running_process"
+        );
+        assert_eq!(
+            value["workspace"]["session_lifecycle"]["pane_command"],
+            "claw"
+        );
+        assert_eq!(value["workspace"]["session_lifecycle"]["abandoned"], false);
     }
 
     #[test]
@@ -12956,6 +13357,32 @@ UU conflicted.rs",
                 "stub command {with_slash} should not appear in REPL completions"
             );
         }
+    }
+
+    #[test]
+    fn stub_commands_absent_from_resume_safe_help() {
+        let mut help = Vec::new();
+        print_help_to(&mut help).expect("help should render");
+        let help = String::from_utf8(help).expect("help should be utf8");
+        let resume_line = help
+            .lines()
+            .find(|line| line.starts_with("Resume-safe commands:"))
+            .expect("resume-safe command line should exist");
+        let resume_roots = resume_line
+            .trim_start_matches("Resume-safe commands:")
+            .split(',')
+            .filter_map(|entry| entry.trim().strip_prefix('/'))
+            .filter_map(|entry| entry.split_whitespace().next())
+            .collect::<Vec<_>>();
+
+        for stub in STUB_COMMANDS {
+            assert!(
+                !resume_roots.contains(stub),
+                "stub command /{stub} should not appear in resume-safe command list"
+            );
+        }
+
+        assert!(resume_roots.contains(&"status"));
     }
 }
 
