@@ -122,6 +122,15 @@ def run_agent_task(
 
     if trace:
         trace_events.append(f'stopped=max_turns:{max_turns}')
+    if edit_required and has_successful_edit(tool_trace, required_edit_target):
+        return AgentRunResult(
+            content=f'Completed the required edit but reached max_turns={max_turns} before a final response.',
+            turns=max_turns,
+            tool_calls=tuple(tool_calls),
+            tool_trace=tuple(tool_trace),
+            stop_reason='completed_after_edit_max_turns',
+            trace_events=tuple(trace_events),
+        )
     raise LLMBackendError(f'Agent stopped after reaching max_turns={max_turns}.')
 
 
@@ -227,6 +236,25 @@ def prompt_requires_edit(prompt: str) -> bool:
 
 
 def infer_required_edit_target(prompt: str) -> str | None:
+    file_pattern = r'[\w./-]+\.(?:py|md|txt|json|yaml|yml|toml)'
+    for pattern in (
+        rf'\bin\s+(?P<path>{file_pattern})(?![\w./-])',
+        rf'\b(?:modify|edit|change|update|write|create|add(?:\s+to)?)\s+only\s+(?P<path>{file_pattern})(?![\w./-])',
+        rf'\b(?:modify|edit|change|update|write|create|add(?:\s+to)?)\s+(?P<path>{file_pattern})(?![\w./-])',
+    ):
+        match = re.search(pattern, prompt, flags=re.IGNORECASE)
+        if match:
+            return match.group('path').rstrip('.,:;')
+
+    file_matches = re.findall(
+        rf'(?<![\w./-])(?P<path>{file_pattern})(?![\w./-])',
+        prompt,
+        flags=re.IGNORECASE,
+    )
+    unique_files = list(dict.fromkeys(path.rstrip('.,:;') for path in file_matches))
+    if len(unique_files) == 1:
+        return unique_files[0]
+
     match = re.search(
         r'(?:modify|edit|change|update|write|create|add(?:\s+to)?)\s+(?P<path>[\w./-]+)',
         prompt,

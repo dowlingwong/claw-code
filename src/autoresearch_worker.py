@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
 import subprocess
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -25,6 +27,7 @@ DEFAULT_AUTORESEARCH_TIMEOUT_SECONDS = 600
 DEFAULT_STATE_FILE = '.autoresearch_state.json'
 DEFAULT_MEMORY_FILE = 'experiment_memory.jsonl'
 AUTORESEARCH_BRANCH_PREFIX = 'autoresearch/'
+NO_LEGACY_COMMITS_ENV = 'AUTORESEARCH_NO_LEGACY_COMMITS'
 
 
 @dataclass(frozen=True)
@@ -170,6 +173,7 @@ def run_autoresearch_packet(
     packet = packet_source if isinstance(packet_source, AutoresearchExperimentPacket) else load_autoresearch_packet(packet_source)
     state = load_autoresearch_state(repo_root)
     base_commit = short_head_commit(repo_root)
+    train_hash_before = _file_sha256(repo_root / 'train.py')
 
     worker = create_worker(root=repo_root, model=model, host=host)
     worker_run = run_worker(
@@ -192,7 +196,29 @@ def run_autoresearch_packet(
         append_memory_event(repo_root, 'run_skipped', result)
         return result
 
-    commit = _commit_train_change(repo_root, packet.description)
+    train_hash_after = _file_sha256(repo_root / 'train.py')
+    if train_hash_before and train_hash_after == train_hash_before:
+        result = {
+            'setup': setup.to_dict(),
+            'state': state.to_dict(),
+            'worker': worker_run.to_dict(),
+            'experiment': None,
+            'results_tsv': str((repo_root / packet.results_tsv).resolve()),
+            'recommended_status': 'discard',
+            'error': 'no_op_patch',
+            'no_op_patch': True,
+            'base_commit': base_commit,
+            'train_hash_before': train_hash_before,
+            'train_hash_after': train_hash_after,
+        }
+        append_memory_event(repo_root, 'run_skipped', result)
+        return result
+
+    commit = (
+        _dirty_candidate_ref(base_commit)
+        if os.environ.get(NO_LEGACY_COMMITS_ENV) == '1'
+        else _commit_train_change(repo_root, packet.description)
+    )
     experiment = run_experiment(
         root=repo_root,
         command=packet.train_command,
@@ -342,7 +368,7 @@ def discard_autoresearch_candidate(root: str | Path | None = None) -> dict[str, 
     pending = _require_pending_experiment(state)
     metrics = ExperimentMetrics(**pending.experiment)
     final_status = 'crash' if not metrics.success or metrics.val_bpb is None else 'discard'
-    _git(repo_root, ['git', 'reset', '--hard', pending.base_commit], check=False)
+    _git(repo_root, ['git', 'checkout', pending.base_commit, '--', 'train.py'], check=False)
     append_results_row(
         repo_root,
         commit=pending.commit,
@@ -597,7 +623,7 @@ def _commit_train_change(root: Path, description: str) -> str:
     message = f'autoresearch: {description.strip()}'
     subprocess.run(['git', 'add', '--', 'train.py'], cwd=root, capture_output=True, text=True, check=False)
     commit = subprocess.run(
-        ['git', 'commit', '-m', message[:120]],
+        ['git', 'commit', '-m', message[:120], '--', 'train.py'],
         cwd=root,
         capture_output=True,
         text=True,
@@ -607,6 +633,10 @@ def _commit_train_change(root: Path, description: str) -> str:
         return short_head_commit(root)
     head = short_head_commit(root)
     return f'{head}-dirty' if head != 'unknown' else 'uncommitted'
+
+
+def _dirty_candidate_ref(base_commit: str) -> str:
+    return f'{base_commit}-dirty' if base_commit != 'unknown' else 'uncommitted'
 
 
 def _require_pending_experiment(state: AutoresearchState) -> PendingExperiment:
@@ -644,3 +674,11 @@ def _suggest_branch_name() -> str:
 
 def _is_isolated_branch(branch: str) -> bool:
     return branch.startswith(AUTORESEARCH_BRANCH_PREFIX)
+
+
+def _file_sha256(path: Path) -> str:
+    if not path.exists():
+        return ''
+    digest = hashlib.sha256()
+    digest.update(path.read_bytes())
+    return digest.hexdigest()

@@ -139,10 +139,12 @@ class AutoresearchIntegrationTests(unittest.TestCase):
                     'verification': {'acceptance_tests': []},
                 },
             )
-            (root / 'train.py').write_text('print("changed")\n', encoding='utf-8')
+            def fake_run_worker(*args, **kwargs):
+                (root / 'train.py').write_text('print("changed")\n', encoding='utf-8')
+                return worker
 
             with patch('src.autoresearch_worker.create_worker', return_value=worker):
-                with patch('src.autoresearch_worker.run_worker', return_value=worker):
+                with patch('src.autoresearch_worker.run_worker', side_effect=fake_run_worker):
                     with patch(
                         'src.autoresearch_worker.run_experiment',
                         return_value=ExperimentMetrics(
@@ -188,10 +190,12 @@ class AutoresearchIntegrationTests(unittest.TestCase):
                     'verification': {'acceptance_tests': []},
                 },
             )
-            (root / 'train.py').write_text('print("changed")\n', encoding='utf-8')
+            def fake_run_worker(*args, **kwargs):
+                (root / 'train.py').write_text('print("changed")\n', encoding='utf-8')
+                return worker
 
             with patch('src.autoresearch_worker.create_worker', return_value=worker):
-                with patch('src.autoresearch_worker.run_worker', return_value=worker):
+                with patch('src.autoresearch_worker.run_worker', side_effect=fake_run_worker):
                     with patch(
                         'src.autoresearch_worker.run_experiment',
                         return_value=ExperimentMetrics(
@@ -240,10 +244,12 @@ class AutoresearchIntegrationTests(unittest.TestCase):
                     'verification': {'acceptance_tests': []},
                 },
             )
-            (root / 'train.py').write_text('print("candidate")\n', encoding='utf-8')
+            def run_candidate(*args, **kwargs):
+                (root / 'train.py').write_text('print("candidate")\n', encoding='utf-8')
+                return worker
 
             with patch('src.autoresearch_worker.create_worker', return_value=worker):
-                with patch('src.autoresearch_worker.run_worker', return_value=worker):
+                with patch('src.autoresearch_worker.run_worker', side_effect=run_candidate):
                     with patch(
                         'src.autoresearch_worker.run_experiment',
                         return_value=ExperimentMetrics(
@@ -259,9 +265,13 @@ class AutoresearchIntegrationTests(unittest.TestCase):
 
             self.assertEqual(result['recommended_status'], 'keep')
             keep_autoresearch_candidate(root)
-            (root / 'train.py').write_text('print("worse")\n', encoding='utf-8')
+
+            def run_worse(*args, **kwargs):
+                (root / 'train.py').write_text('print("worse")\n', encoding='utf-8')
+                return worker
+
             with patch('src.autoresearch_worker.create_worker', return_value=worker):
-                with patch('src.autoresearch_worker.run_worker', return_value=worker):
+                with patch('src.autoresearch_worker.run_worker', side_effect=run_worse):
                     with patch(
                         'src.autoresearch_worker.run_experiment',
                         return_value=ExperimentMetrics(
@@ -277,7 +287,7 @@ class AutoresearchIntegrationTests(unittest.TestCase):
 
             discard = discard_autoresearch_candidate(root)
             self.assertEqual(discard['decision'], 'discard')
-            self.assertEqual(short_head_commit(root), discard['reverted_to_commit'])
+            self.assertEqual(short_head_commit(root), discard['current_commit'])
             self.assertIn('candidate', (root / 'train.py').read_text(encoding='utf-8'))
             self.assertNotEqual(short_head_commit(root), 'unknown')
 
@@ -349,14 +359,16 @@ class AutoresearchIntegrationTests(unittest.TestCase):
                     'verification': {'acceptance_tests': []},
                 },
             )
-            (root / 'train.py').write_text('print("changed")\n', encoding='utf-8')
+            def fake_run_worker(*args, **kwargs):
+                (root / 'train.py').write_text('print("changed")\n', encoding='utf-8')
+                return worker
 
             with patch(
                 'src.autoresearch_worker.ensure_autoresearch_baseline',
                 return_value={'baseline_created': False, 'reason': 'baseline already recorded'},
             ):
                 with patch('src.autoresearch_worker.create_worker', return_value=worker):
-                    with patch('src.autoresearch_worker.run_worker', return_value=worker):
+                    with patch('src.autoresearch_worker.run_worker', side_effect=fake_run_worker):
                         with patch(
                             'src.autoresearch_worker.run_experiment',
                             return_value=ExperimentMetrics(

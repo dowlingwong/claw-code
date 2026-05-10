@@ -371,6 +371,14 @@ class PortingWorkspaceTests(unittest.TestCase):
             'train.py',
         )
 
+    def test_infer_required_edit_target_prefers_unique_file_reference(self) -> None:
+        prompt = (
+            'Objective: In train.py, Change WEIGHT_DECAY from 1e-4 to 5e-5. '
+            'Scope: Modify only train.py in the autoresearch repo. '
+            'You may read program.md and README.md but do not edit prepare.py or pyproject.toml.'
+        )
+        self.assertEqual(infer_required_edit_target(prompt), 'train.py')
+
     def test_infer_tool_call_from_prompt_recognizes_read_and_search(self) -> None:
         read_call = infer_tool_call_from_prompt('read src/main.py lines 1 to 40')
         search_call = infer_tool_call_from_prompt("search the src tree for 'agent_parser'")
@@ -543,6 +551,37 @@ class PortingWorkspaceTests(unittest.TestCase):
                 )
 
             self.assertTrue(target.read_text(encoding='utf-8').startswith('# smoke-test comment: 2\n'))
+
+    def test_run_agent_task_accepts_successful_edit_at_max_turns(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            target = root / 'train.py'
+            target.write_text('WEIGHT_DECAY = 1e-4\n', encoding='utf-8')
+            responses = [
+                normalize_ollama_response(
+                    {
+                        'message': {
+                            'content': (
+                                '{"type":"tool_call","name":"edit_file","arguments":'
+                                '{"path":"train.py","old_text":"WEIGHT_DECAY = 1e-4",'
+                                '"new_text":"WEIGHT_DECAY = 5e-5"}}'
+                            )
+                        }
+                    }
+                ),
+            ]
+            with patch('src.agent_loop.OllamaBackend.chat', side_effect=responses):
+                result = run_agent_task(
+                    'Objective: In train.py, Change WEIGHT_DECAY from 1e-4 to 5e-5.',
+                    root=root,
+                    max_turns=1,
+                    trace=True,
+                )
+
+            self.assertEqual(target.read_text(encoding='utf-8'), 'WEIGHT_DECAY = 5e-5\n')
+            self.assertEqual(result.stop_reason, 'completed_after_edit_max_turns')
+            self.assertEqual(result.tool_calls, ('edit_file',))
+            self.assertTrue(any('stopped=max_turns:1' in event for event in result.trace_events))
 
     def test_has_successful_edit_requires_target_path(self) -> None:
         tool_trace = [
