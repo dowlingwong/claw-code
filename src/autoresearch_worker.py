@@ -253,6 +253,7 @@ def run_autoresearch_packet(
         'worker': worker_run.to_dict(),
         'experiment': experiment.to_dict(),
         'results_tsv': str((repo_root / packet.results_tsv).resolve()),
+        'base_commit': base_commit,
         'commit': commit,
         'recommended_status': recommended_status,
         'description': packet.description,
@@ -484,6 +485,27 @@ def loop_autoresearch(
             )
             continue
 
+        # Capture the diff BEFORE discard restores train.py.
+        # With AUTORESEARCH_NO_LEGACY_COMMITS=1 (Stage 2 default), edits are
+        # left as working-tree modifications, so `git diff -- train.py` captures
+        # the full change. If the edit was actually committed (real-commit path),
+        # fall back to a commit-range diff against the pending base_commit.
+        pending_exp = PendingExperiment.from_dict(state.pending_experiment)
+        diff_wt = _git(repo_root, ['git', 'diff', '--', 'train.py'], check=False)
+        candidate_patch_diff = (
+            diff_wt.stdout if diff_wt.returncode == 0 and diff_wt.stdout.strip() else ''
+        )
+        if not candidate_patch_diff:
+            bc = pending_exp.base_commit
+            if bc and bc not in ('unknown', ''):
+                diff_commit = _git(
+                    repo_root,
+                    ['git', 'diff', f'{bc}..HEAD', '--', 'train.py'],
+                    check=False,
+                )
+                if diff_commit.returncode == 0:
+                    candidate_patch_diff = diff_commit.stdout
+
         decision = (
             keep_autoresearch_candidate(repo_root)
             if run_result.get('recommended_status') == 'keep'
@@ -494,6 +516,7 @@ def loop_autoresearch(
                 'iteration': iteration,
                 'run': run_result,
                 'decision': decision,
+                'candidate_patch_diff': candidate_patch_diff,
             }
         )
 
